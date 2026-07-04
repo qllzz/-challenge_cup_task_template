@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>challenge_cup_task_template</name>
+  <version>1.0.0</version>
+  <description>挑战杯仿真赛选手任务模板功能包：提供 scene1/2/3 一键启动入口脚本</description>
+
+  <maintainer email="challenge@example.com">challenge</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>challenge_cup_simulator</exec_depend>
+
+  <export>
+  </export>
+</package>

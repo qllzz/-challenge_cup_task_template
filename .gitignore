@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# ROS
+build/
+devel/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
