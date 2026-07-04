@@ -61,123 +61,41 @@ def run_scene(scene, seed, node_name=None, timeout=120,
 
     import rospy
 
-    # 把 src/ 目录加入搜索路径，让下面的 import 能找到 robot_api
-    _pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    sys.path.insert(0, os.path.join(_pkg_dir, "src"))
-    from robot_api import RobotMover, ArmController, ClawController
-
-    # 用 print 代替 rospy.loginfo，确保测试日志不被 ROS 过滤
+    # ---- 日志工具 ----
     def log(msg, *args):
         if args:
             msg = msg % args
         print("\n>>> " + msg + "\n", flush=True)
 
+    # ---- 引入控制 API 和场景模块 ----
+    _scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    _pkg_dir = os.path.dirname(_scripts_dir)
+    sys.path.insert(0, os.path.join(_pkg_dir, "src"))
+    sys.path.insert(0, _scripts_dir)
+
+    from robot_api import RobotMover, ArmController, ClawController
+
     log("=== %s任务启动 ===", config["title"])
 
-    # 创建三个控制器对象
     robot = RobotMover()
     arm = ArmController()
     claw = ClawController()
 
     rospy.sleep(1.0)
-    log("场景实例已初始化。")
+    log("场景实例已初始化，控制器就绪。")
 
-    # ========================================
-    # TODO: 在此实现三场景共用或按 scene 分支的任务逻辑
-    # ========================================
-    #
-    # 封装后的接口速查：
-    #   robot.move_forward(speed, duration)    — 前进
-    #   robot.move_backward(speed, duration)   — 后退
-    #   robot.turn_left(speed, duration)       — 左转
-    #   robot.turn_right(speed, duration)      — 右转
-    #   robot.stop()                           — 立即停下
-    #   arm.switch_to_external_control()        — 切到外部控制模式
-    #   arm.go_to_joints([14个角度])             — 手臂到目标位置
-    #   arm.go_home()                          — 手臂归零
-    #   claw.open()                            — 夹爪张开
-    #   claw.close()                           — 夹爪闭合
-    #   claw.is_grabbed()                      — 是否抓住物体
-
+    # ---- 根据 scene 参数分发到对应模块 ----
     if scene == "scene1":
-        # ============================================================
-        # 场景一 用作 RobotMover 全面测试
-        # 注意：双足机器人横移/转身容易失稳，速度不宜过大
-        # ============================================================
-        log("=" * 50)
-        log("[TEST 1/8] 前进 0.05 m/s，持续 2 秒（安全）")
-        robot.move_forward(0.05, duration=2.0)
-        rospy.sleep(1.0)
-
+        from scene1_task import run_scene1
+        run_scene1(robot, arm, claw, log)
     elif scene == "scene2":
-        # ============================================================
-        # 场景二 用作 ArmController 测试
-        # ============================================================
-        log("=" * 50)
-        log("[TEST 1/5] 切换手臂到外部控制模式")
-        ok = arm.switch_to_external_control()
-        log("切换结果: %s", "成功" if ok else "失败")
-        rospy.sleep(1.0)
-
-        log("[TEST 2/5] go_home() — 全部关节归零")
-        arm.go_home()
-        rospy.sleep(2.0)
-
-        log("[TEST 3/5] go_ready() — 双手前伸准备姿势")
-        arm.go_ready()
-        rospy.sleep(2.0)
-
-        log("[TEST 4/5] 左臂单独控制 — 肩前 40° 肘弯 60°")
-        arm.left_arm_to([40.0, -15.0, 0.0, -60.0, 0.0, 0.0, 0.0])
-        rospy.sleep(2.0)
-        arm.go_home()
-        rospy.sleep(1.5)
-
-        log("[TEST 5/5] 右臂单独控制 — 肩前 40° 肘弯 60°")
-        arm.right_arm_to([40.0, 15.0, 0.0, -60.0, 0.0, 0.0, 0.0])
-        rospy.sleep(2.0)
-        arm.go_home()
-
-        log("场景二：ArmController 全部 5 项测试通过！")
-
+        from scene2_task import run_scene2
+        run_scene2(robot, arm, claw, log)
     elif scene == "scene3":
-        # ============================================================
-        # 场景三 用作 ClawController 测试
-        # ============================================================
-        log("=" * 50)
-        log("[TEST 1/6] 双手闭合")
-        claw.close()
-        rospy.sleep(1.0)
-        log("夹爪状态: 左=%s 右=%s 抓住=%s",
-            claw._left_state, claw._right_state, claw.is_grabbed())
+        from scene3_task import run_scene3
+        run_scene3(robot, arm, claw, log)
 
-        log("[TEST 2/6] 双手张开")
-        claw.open()
-        rospy.sleep(1.0)
-        log("夹爪状态: 左=%s 右=%s 抓住=%s",
-            claw._left_state, claw._right_state, claw.is_grabbed())
-
-        log("[TEST 3/6] 分别设置左右开合 — 左闭 80%% 右开 20%%")
-        claw.set_position(80, 20)
-        rospy.sleep(1.0)
-
-        log("[TEST 4/6] 只闭合左夹爪")
-        claw.left_close()
-        rospy.sleep(1.0)
-
-        log("[TEST 5/6] 只张开右夹爪")
-        claw.right_open()
-        rospy.sleep(1.0)
-        log("夹爪状态: 左=%s 右=%s",
-            claw._left_state, claw._right_state)
-
-        log("[TEST 6/6] wait_until_done() — 等待夹爪运动完成")
-        claw.close()
-        done = claw.wait_until_done(timeout=3.0)
-        log("夹爪运动完成: %s", "是" if done else "超时")
-
-        log("场景三：ClawController 全部 6 项测试通过！")
-
+    log("%s 任务执行完毕。", config["title"])
     rospy.spin()
 
 
