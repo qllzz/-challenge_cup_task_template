@@ -18,7 +18,7 @@
 import rospy
 
 
-def run_scene2(robot, arm, claw, log):
+def run_scene2(robot, arm, claw, head, log):
     """
     场景二任务主逻辑。
 
@@ -26,6 +26,7 @@ def run_scene2(robot, arm, claw, log):
         robot — RobotMover 实例
         arm   — ArmController 实例
         claw  — ClawController 实例
+        head  — HeadController 实例
         log   — 日志函数
     """
     log("=" * 50)

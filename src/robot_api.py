@@ -6,23 +6,30 @@
 不用关心 Twist、JointState 等消息格式。
 
 用法示例:
-    from robot_api import RobotMover, ArmController, ClawController
+    from robot_api import RobotMover, ArmController, ClawController, HeadController
 
     robot = RobotMover()
     arm = ArmController()
     claw = ClawController()
+    head = HeadController()
 
     robot.move_forward(0.2, duration=2.0)   # 前进 2 秒
     arm.switch_to_external_control()         # 切到外部控制模式
+    q_arm = arm.solve_ik([0.5,0,0.8], [1,0,0,0], ...)  # IK 求解
     claw.close()                             # 闭合夹爪
+    head.look_at(0, -10)                    # 平视、低头 10°
 """
 
 import time
 import rospy
 from geometry_msgs.msg import Twist
+from std_msgs.msg import String
 from sensor_msgs.msg import JointState
-from kuavo_msgs.srv import controlLejuClaw, changeArmCtrlMode
-from kuavo_msgs.msg import lejuClawState, endEffectorData
+from kuavo_msgs.srv import controlLejuClaw, changeArmCtrlMode, twoArmHandPoseCmdSrv
+from kuavo_msgs.msg import (lejuClawState, endEffectorData,
+                            twoArmHandPoseCmd, twoArmHandPose,
+                            armHandPose, ikSolveParam,
+                            robotHeadMotionData)
 
 
 # ============================================================
@@ -42,7 +49,7 @@ class RobotMover:
 
     def __init__(self):
         self._pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
-        # 等 publisher 注册完成
+        self._gait_pub = rospy.Publisher("/humanoid_mpc_gait_change", String, queue_size=10)
         rospy.sleep(0.1)
 
     # ---- 基础移动 ----
@@ -81,6 +88,16 @@ class RobotMover:
         for _ in range(10):
             self._pub.publish(twist)
             rospy.sleep(0.05)
+
+    # ---- 步态切换 ----
+
+    def switch_to_walk(self):
+        """手动切到行走步态。通常 /cmd_vel 非零时自动切换，无需手动调用。"""
+        self._gait_pub.publish(String(data="walk"))
+
+    def switch_to_stance(self):
+        """手动切到站步步态。通常 /cmd_vel 全零时自动切换，无需手动调用。"""
+        self._gait_pub.publish(String(data="stance"))
  
 
     # ---- 组合移动 ----
@@ -223,6 +240,66 @@ class ArmController:
         full[7:14] = joints
         self.go_to_joints(full)
 
+    # ---- IK 求解 ----
+
+    def solve_ik(self, left_pose_xyz, left_quat_xyzw,
+                 right_pose_xyz, right_quat_xyzw,
+                 frame=2, use_current_as_q0=True):
+        """
+        调用 IK 服务，输入双手末端位姿，返回 14 个关节角度。
+
+        参数:
+            left_pose_xyz   — 左手末端位置 [x, y, z]，单位 米
+            left_quat_xyzw  — 左手末端姿态 [x, y, z, w] 四元数
+            right_pose_xyz  — 右手末端位置 [x, y, z]，单位 米
+            right_quat_xyzw — 右手末端姿态 [x, y, z, w] 四元数
+            frame           — 坐标系: 0=当前 1=odom 2=局部(默认) 3=VR 4=操作世界 5=关节空间
+            use_current_as_q0 — 用当前关节角作为初值（通常 True）
+
+        返回:
+            (success, q_arm) — success 为 True 时 q_arm 是 14 个关节角度(度)
+        """
+        rospy.wait_for_service("/ik/two_arm_hand_pose_cmd_srv", timeout=5.0)
+        try:
+            srv = rospy.ServiceProxy("/ik/two_arm_hand_pose_cmd_srv", twoArmHandPoseCmdSrv)
+
+            # 构建左右手姿态
+            left_hp = armHandPose()
+            left_hp.pos_xyz = list(left_pose_xyz)
+            left_hp.quat_xyzw = list(left_quat_xyzw)
+
+            right_hp = armHandPose()
+            right_hp.pos_xyz = list(right_pose_xyz)
+            right_hp.quat_xyzw = list(right_quat_xyzw)
+
+            # 构建双手位姿消息
+            hand_poses = twoArmHandPose()
+            hand_poses.left_pose = left_hp
+            hand_poses.right_pose = right_hp
+
+            # 构建请求
+            req = twoArmHandPoseCmd()
+            req.hand_poses = hand_poses
+            req.frame = frame
+            req.joint_angles_as_q0 = use_current_as_q0
+            req.use_custom_ik_param = False  # 用默认 IK 参数即可
+
+            resp = srv(req)
+
+            if resp.success:
+                # q_arm 是弧度，转为度
+                import math
+                q_deg = [math.degrees(q) for q in resp.q_arm]
+                rospy.loginfo("IK 求解成功，耗时 %.1f ms", resp.time_cost)
+                return True, q_deg
+            else:
+                rospy.logerr("IK 求解失败: %s", resp.error_reason)
+                return False, []
+
+        except rospy.ServiceException as e:
+            rospy.logerr("IK 服务调用失败: %s", e)
+            return False, []
+
 
 # ============================================================
 #  ClawController —— 二指夹爪控制
@@ -360,3 +437,61 @@ class ClawController:
         if len(msg.state) >= 2:
             self._left_state = msg.state[0]
             self._right_state = msg.state[1]
+
+
+# ============================================================
+#  HeadController —— 头部控制
+# ============================================================
+class HeadController:
+    """
+    控制机器人头部（云台）运动。
+
+    用法:
+        head = HeadController()
+        head.look_at(0, 0)     # 直视前方
+        head.look_at(20, -10)  # 右看 20°，低头 10°
+        head.look_left(15)     # 只看左边
+        head.look_down(20)     # 只看下面
+    """
+
+    def __init__(self):
+        self._pub = rospy.Publisher("/robot_head_motion_data",
+                                    robotHeadMotionData, queue_size=10)
+        rospy.sleep(0.1)
+
+    def look_at(self, yaw=0.0, pitch=0.0):
+        """
+        控制头部角度。
+
+        参数:
+            yaw   — 偏航角 度，范围 [-30, 30]，正=右看，负=左看
+            pitch — 俯仰角 度，范围 [-25, 25]，正=抬头，负=低头
+        """
+        yaw = max(-30.0, min(30.0, yaw))
+        pitch = max(-25.0, min(25.0, pitch))
+        msg = robotHeadMotionData()
+        msg.joint_data = [float(yaw), float(pitch)]
+        self._pub.publish(msg)
+        rospy.loginfo("头部: yaw=%.1f° pitch=%.1f°", yaw, pitch)
+
+    # ---- 快捷方法 ----
+
+    def look_forward(self):
+        """直视前方。"""
+        self.look_at(0, 0)
+
+    def look_left(self, angle=15.0):
+        """向左看。angle 为正数。"""
+        self.look_at(-abs(angle), 0)
+
+    def look_right(self, angle=15.0):
+        """向右看。"""
+        self.look_at(abs(angle), 0)
+
+    def look_up(self, angle=15.0):
+        """抬头。"""
+        self.look_at(0, abs(angle))
+
+    def look_down(self, angle=15.0):
+        """低头。"""
+        self.look_at(0, -abs(angle))

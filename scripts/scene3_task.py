@@ -20,7 +20,7 @@
 import rospy
 
 
-def run_scene3(robot, arm, claw, log):
+def run_scene3(robot, arm, claw, head, log):
     """
     场景三任务主逻辑。
 
@@ -28,6 +28,7 @@ def run_scene3(robot, arm, claw, log):
         robot — RobotMover 实例
         arm   — ArmController 实例
         claw  — ClawController 实例
+        head  — HeadController 实例
         log   — 日志函数
     """
     log("=" * 50)
@@ -39,7 +40,9 @@ def run_scene3(robot, arm, claw, log):
     # ============================================================
     log("[STEP 1] 切换手臂到外部控制模式")
     arm.switch_to_external_control()
-    rospy.sleep(1.0)
+    rospy.sleep(0.5)
+    arm.go_home()  # 给控制器一个初始目标，否则会一直刷等待消息
+    rospy.sleep(0.5)
 
     # ============================================================
     # TODO: 在这里实现场景三的任务逻辑
