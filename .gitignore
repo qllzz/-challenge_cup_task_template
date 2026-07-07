@@ -10,6 +10,10 @@ __pycache__/
 # ROS
 build/
 devel/
+.catkin_tools/
+
+# container runtime data
+fakehome/
 
 # OS
 .DS_Store
@@ -17,3 +21,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Custom
+*.tar.gz
+leju-kuavo-challenge-cup-2026/

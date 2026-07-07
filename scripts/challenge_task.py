@@ -62,10 +62,16 @@ def run_scene(scene, seed, node_name=None, timeout=120,
     import rospy
 
     # ---- 日志工具（同时输出到 ROS 日志和终端）----
+    _dbg = open("/tmp/challenge_task_debug.log", "a")
+    _dbg.write(f"=== launcher.start() returned for {scene} ===\n")
+    _dbg.flush()
+
     def log(msg, *args):
         if args:
             msg = msg % args
         rospy.loginfo(">>> " + msg)
+        _dbg.write(">>> " + msg + "\n")
+        _dbg.flush()
 
     # ---- 引入控制 API 和场景模块 ----
     _scripts_dir = os.path.dirname(os.path.abspath(__file__))
@@ -73,31 +79,37 @@ def run_scene(scene, seed, node_name=None, timeout=120,
     sys.path.insert(0, os.path.join(_pkg_dir, "src"))
     sys.path.insert(0, _scripts_dir)
 
-    from robot_api import RobotMover, ArmController, ClawController, HeadController
+    try:
+        from robot_api import RobotMover, ArmController, ClawController, HeadController
 
-    log("=== %s任务启动 ===", config["title"])
+        log("=== %s任务启动 ===", config["title"])
 
-    robot = RobotMover()
-    arm = ArmController()
-    claw = ClawController()
-    head = HeadController()
+        robot = RobotMover()
+        arm = ArmController()
+        claw = ClawController()
+        head = HeadController()
 
-    rospy.sleep(1.0)
-    log("场景实例已初始化，控制器就绪。")
+        rospy.sleep(1.0)
+        log("场景实例已初始化，控制器就绪。")
 
-    # ---- 根据 scene 参数分发到对应模块 ----
-    if scene == "scene1":
-        from scene1_task import run_scene1
-        run_scene1(robot, arm, claw, head, log)
-    elif scene == "scene2":
-        from scene2_task import run_scene2
-        run_scene2(robot, arm, claw, head, log)
-    elif scene == "scene3":
-        from scene3_task import run_scene3
-        run_scene3(robot, arm, claw, head, log)
+        # ---- 根据 scene 参数分发到对应模块 ----
+        if scene == "scene1":
+            from scene1_task import run_scene1
+            run_scene1(robot, arm, claw, head, log)
+        elif scene == "scene2":
+            from scene2_task import run_scene2
+            run_scene2(robot, arm, claw, head, log)
+        elif scene == "scene3":
+            from scene3_task import run_scene3
+            run_scene3(robot, arm, claw, head, log)
 
-    log("%s 任务执行完毕。", config["title"])
-    rospy.spin()
+        log("%s 任务执行完毕。", config["title"])
+        rospy.spin()
+    except Exception:
+        import traceback
+        _dbg.write(traceback.format_exc())
+        _dbg.flush()
+        raise
 
 
 def main():
