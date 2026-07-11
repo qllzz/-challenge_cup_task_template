@@ -1,534 +1,444 @@
 #!/usr/bin/env python3
-"""
-场景三：SMT 料盘出库。
-
-场景对象：
-  - SMT 货架: smt_rack（上下两层）
-  - 料盘: smt_tray_1 ~ smt_tray_5
-  - 出库区: sorting_box_0p4_0p3_0p3
-
-任务流程：
-  1. 识别 smt_rack 和目标料盘
-  2. 判断料盘所在层级（上层 10 分，下层 20 分）
-  3. 估计料盘前缘、中心、拉出方向
-  4. 移动到货架前预操作位
-  5. 手臂进入预托取位姿 → 抓住/托住料盘前缘
-  6. 沿货架外法线低速拉出 → 抬升到安全高度
-  7. 搬运到出库区 → 放置
-"""
-
-import sys
-import os
-import math
 
 import rospy
-import numpy as np
-from geometry_msgs.msg import Point
-from visualization_msgs.msg import Marker, MarkerArray
-from std_msgs.msg import ColorRGBA
+import numpy
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+ 
+from perception_api import CameraReader
+from sensor_msgs.msg import CameraInfo
+
+def depthToPos(depth, fx, fy, cx, cy):
+    h, w = depth.shape
+    u, v = numpy.meshgrid(numpy.arange(w), numpy.arange(h))
+    z = depth.astype(numpy.float32)
+    x = (u - cx) * z / fx
+    y = (v - cy) * z / fy
+    pos = numpy.stack((x, y, z), axis=-1)
+    return pos
+
+def mulFract(x, factor):
+    x = x * factor
+    return x - numpy.floor(x)
+
+def getDiffBlendFactor(absDiff, s):
+    return 1.0 / (1.0 + numpy.exp(absDiff * s))
+
+def getNormalDot(normal):
+    normalWithPadding = numpy.pad(normal, ((1, 1), (1, 1), (0, 0)), mode='edge')
+    normalT = normalWithPadding[:-2, 1:-1]
+    normalL = normalWithPadding[1:-1, :-2]
+    normalR = normalWithPadding[1:-1, 2:]
+    normalB = normalWithPadding[2:, 1:-1]
+
+    normalDotT = 1.0 - numpy.sum(normalT * normal, axis=-1)
+    normalDotL = 1.0 - numpy.sum(normalL * normal, axis=-1)
+    normalDotR = 1.0 - numpy.sum(normalR * normal, axis=-1)
+    normalDotB = 1.0 - numpy.sum(normalB * normal, axis=-1)
+
+    return normalDotL * normalDotR, normalDotB * normalDotT
 
 
-# ---------------------------------------------------------------------------
-# 可视化：MarkerArray 球体标记料盘位置
-# ---------------------------------------------------------------------------
+def posToNormal(pos, depth):
+    posWithPadding = numpy.pad(pos, ((1, 1), (1, 1), (0, 0)), mode='constant', constant_values=0)
+    depthWithPadding = numpy.pad(depth, ((1, 1), (1, 1)), mode='constant', constant_values=-100000)
 
-_MARKER_PUB = None
+    depthT = depthWithPadding[:-2, 1:-1]
+    depthL = depthWithPadding[1:-1, :-2]
+    depthR = depthWithPadding[1:-1, 2:]
+    depthB = depthWithPadding[2:, 1:-1]
 
+    depthAbsDiffT = numpy.abs(depthT - depth)
+    depthAbsDiffL = numpy.abs(depthL - depth)
+    depthAbsDiffR = numpy.abs(depthR - depth)
+    depthAbsDiffB = numpy.abs(depthB - depth)
 
-def _get_marker_pub():
-    global _MARKER_PUB
-    if _MARKER_PUB is None:
-        _MARKER_PUB = rospy.Publisher("/detected_trays", MarkerArray, queue_size=1)
-        rospy.sleep(0.2)
-    return _MARKER_PUB
+    horiFactor = getDiffBlendFactor(depthAbsDiffR - depthAbsDiffL, 0.1)[..., numpy.newaxis]
+    vertFactor = getDiffBlendFactor(depthAbsDiffB - depthAbsDiffT, 0.1)[..., numpy.newaxis]
 
+    posT  = posWithPadding[:-2, 1:-1] 
+    posL  = posWithPadding[1:-1, :-2] 
+    posR  = posWithPadding[1:-1, 2:]  
+    posB  = posWithPadding[2:, 1:-1] 
 
-def _make_color(r, g, b, a=0.8):
-    c = ColorRGBA()
-    c.r, c.g, c.b, c.a = r, g, b, a
-    return c
+    Tu = ( posR - pos ) * horiFactor + ( pos - posL ) * (1.0 - horiFactor)
+    Tv = ( posB - pos ) * vertFactor + ( pos - posT ) * (1.0 - vertFactor)
+    
+    normal_raw = numpy.cross(Tu, Tv, axis=2)
+    norm = numpy.linalg.norm(normal_raw, axis=2, keepdims=True)
+    normal = normal_raw / norm
+    
+    return normal
 
-
-def publish_tray_markers(result, log, frame="base_link"):
+def getCylinderAxis(vectors, max_iter=50, tol=1e-6):
     """
-    在 RViz 中标记检测到的料盘位置。
-    绿色球 = 下层（20分），黄色球 = 上层（10分）。
+    使用 Tukey's Biweight (M-estimator) 估计中轴方向
+    Args:
+        vectors: (N, 3) 单位向量
+    Returns:
+        axis: (3,) 中轴单位向量
     """
-    markers = MarkerArray()
-    marker_id = 0
+    # 1. 初始值：先用普通 PCA 给个初值（虽然怕噪，但方向大差不差）
+    M = vectors.T @ vectors
+    _, eig_vecs = numpy.linalg.eigh(M)
+    axis = eig_vecs[:, 0].copy()  # 最小特征向量
+    if axis[2] < 0:
+        axis = -axis
+    
+    # 2. 计算初始投影中位数，确定平面常数 c
+    proj = vectors @ axis
+    c = numpy.median(proj)
+    
+    for _ in range(max_iter):
+        # 计算残差（向量到拟合平面的距离）
+        residuals = numpy.abs(vectors @ axis - c)
+        
+        # 计算缩放常数（Tukey 的调谐常数，通常取 4.685 对应 95% 效率）
+        # 这里用中位数绝对偏差 (MAD) 做稳健缩放
+        mad = numpy.median(residuals) / 0.6745  # 0.6745 是正态分布缩放因子
+        if mad < 1e-12:
+            break  # 已经完美拟合
+        
+        # 归一化残差
+        u = residuals / (mad * 4.685)  # 4.685 是 Tukey 常用常数
+        
+        # 计算 Tukey 双平方权重：|u|<=1 时权重递减，|u|>1 时权重为0
+        weights = numpy.ones_like(u)
+        mask = numpy.abs(u) < 1.0
+        weights[mask] = (1 - u[mask]**2) ** 2
+        weights[~mask] = 0  # 完全剔除极端离群点
+        
+        # 如果大部分点被剔除，提前退出
+        if numpy.sum(weights) < 3:
+            break
+            
+        # 加权 PCA：计算加权协方差矩阵 M_w
+        weighted_vectors = vectors * weights[:, numpy.newaxis]  # 逐行加权
+        M_w = weighted_vectors.T @ vectors  # 注意这里不除以N，不影响特征向量
+        
+        # 特征分解取最小特征向量
+        _, eig_vecs_new = numpy.linalg.eigh(M_w)
+        axis_new = eig_vecs_new[:, 0]
+        if axis_new[2] < 0:
+            axis_new = -axis_new
+            
+        # 更新平面常数 c
+        proj_new = vectors @ axis_new
+        c_new = numpy.median(proj_new)  # 用中位数抗噪
+        
+        # 检查收敛
+        if numpy.linalg.norm(axis - axis_new) < tol:
+            axis = axis_new
+            c = c_new
+            break
+            
+        axis = axis_new
+        c = c_new
+        
+    return axis
 
-    colors = {20: _make_color(0.0, 0.9, 0.1), 10: _make_color(1.0, 0.85, 0.0)}
+def getAvgDir(vectors):
+    mean = numpy.sum(vectors, axis=0)
+    mean /= numpy.linalg.norm(mean)
+    dots = vectors @ mean
+    threshold = numpy.percentile(dots, 10)  
+    mask = dots >= threshold
+    final = numpy.sum(vectors[mask], axis=0)
+    final /= numpy.linalg.norm(final)
+    return final
 
-    for level in result["trays"]:
-        score = level["score"]
-        for cx, cy, cz in level["slots"]:
-            m = Marker()
-            m.header.frame_id = frame
-            m.header.stamp = rospy.Time.now()
-            m.ns = "tray_lower" if score == 20 else "tray_upper"
-            m.id = marker_id
-            marker_id += 1
-            m.type = Marker.SPHERE
-            m.action = Marker.ADD
-            m.pose.position = Point(x=cx, y=cy, z=cz)
-            m.pose.orientation.w = 1.0
-            m.scale.x = m.scale.y = m.scale.z = 0.04
-            m.color = colors.get(score, _make_color(1.0, 1.0, 1.0))
-            m.lifetime = rospy.Duration(0)
-            markers.markers.append(m)
+def hsvKey(hsv_image, hsv_color, tolerances):
+    H_MAX = 179
+    S_MAX = 255
+    V_MAX = 255
 
-    pub = _get_marker_pub()
-    pub.publish(markers)
-    log("已发布 %d 个料盘标记到 /detected_trays", marker_id)
+    hsv_color = numpy.array(hsv_color, dtype=numpy.int16)
+    tol = numpy.array(tolerances, dtype=numpy.int16)
 
+    h_center, s_center, v_center = hsv_color
+    h_tol, s_tol, v_tol = tol
 
-# ---------------------------------------------------------------------------
-# 摆头：将头部对准检测到的料盘
-# ---------------------------------------------------------------------------
+    s_low = numpy.clip(s_center - s_tol, 0, S_MAX).astype(numpy.uint8)
+    s_high = numpy.clip(s_center + s_tol, 0, S_MAX).astype(numpy.uint8)
+    v_low = numpy.clip(v_center - v_tol, 0, V_MAX).astype(numpy.uint8)
+    v_high = numpy.clip(v_center + v_tol, 0, V_MAX).astype(numpy.uint8)
 
-def look_at_trays(head, log, result, dwell=1.5):
-    """
-    依次将头部转向每个检测到的料盘。
-    优先看下层（20 分），再看上层（10 分）。
+    mask = numpy.zeros(hsv_image.shape[:2], dtype=numpy.uint8)  
+    h_low_raw = h_center - h_tol
+    h_high_raw = h_center + h_tol
 
-    head — HeadController 实例
-    dwell — 每个料盘停留的秒数
-    """
-    all_slots = []
-    for level in result["trays"]:
-        for cx, cy, cz in level["slots"]:
-            all_slots.append((cx, cy, cz, level["score"]))
+    if h_low_raw <= 0 and h_high_raw >= H_MAX:
+        lower = numpy.array([0, s_low, v_low], dtype=numpy.uint8)
+        upper = numpy.array([H_MAX, s_high, v_high], dtype=numpy.uint8)
+        return cv2.inRange(hsv_image, lower, upper)
 
-    if not all_slots:
-        log("无料盘可查看")
-        return
+    intervals = []
+    if h_low_raw >= 0 and h_high_raw <= H_MAX:
+        intervals.append((h_low_raw, h_high_raw))
+    else:
+        if h_low_raw < 0:
+            intervals.append((0, min(h_high_raw, H_MAX)))
+            intervals.append((max(0, h_low_raw + H_MAX), H_MAX))
+        if h_high_raw > H_MAX:
+            intervals.append((max(0, h_low_raw), H_MAX))
+            intervals.append((0, min(h_high_raw - H_MAX, H_MAX)))
 
-    # 头部在 base_link 下的近似位置（胯高 ~0.92m，头部在胯上方 ~0.88m）
-    head_x, head_y, head_z = 0.05, 0.0, 0.88
-
-    # 下层优先
-    all_slots.sort(key=lambda s: -s[3])
-
-    for cx, cy, cz, score in all_slots:
-        dx = cx - head_x
-        dy = cy - head_y
-        dz = cz - head_z
-
-        yaw_deg = math.degrees(math.atan2(dy, dx))
-        pitch_deg = math.degrees(math.atan2(dz, math.sqrt(dx * dx + dy * dy)))
-
-        # 钳位到头部限位
-        yaw_clamped = max(-30.0, min(30.0, yaw_deg))
-        pitch_clamped = max(-25.0, min(25.0, pitch_deg))
-
-        label = "下层[20分]" if score == 20 else "上层[10分]"
-        log("  摆头→%s yaw=%.1f° pitch=%.1f° (base: %.2f,%.2f,%.2f)",
-            label, yaw_clamped, pitch_clamped, cx, cy, cz)
-
-        head.look_at(yaw_clamped, pitch_clamped)
-        rospy.sleep(dwell)
-
-    head.look_forward()
-
-
-# ---------------------------------------------------------------------------
-# 雷达感知：货架扫描 & 料盘检测
-# ---------------------------------------------------------------------------
-
-def _log(ros_log, msg, *args):
-    """同时输出到 rospy 日志和 stdout，确保终端可见。"""
-    if args:
-        msg = msg % args
-    ros_log(msg)
-    print(msg)
-
-
-def _cluster_1d(values, gap_threshold, min_size=10):
-    """一维间隙聚类：沿单一轴按间隙 > threshold 切分，过滤小簇噪声。"""
-    if len(values) < min_size:
-        return []
-    order = np.argsort(values)
-    splits = [0]
-    for i in range(1, len(order)):
-        if values[order[i]] - values[order[i - 1]] > gap_threshold:
-            splits.append(i)
-    splits.append(len(order))
-    clusters = []
-    for s, e in zip(splits[:-1], splits[1:]):
-        if e - s >= min_size:
-            clusters.append(order[s:e])
-    return clusters
-
-
-def _merge_clusters(clusters, pts, merge_eps=0.10):
-    """
-    将 3D 聚类中距离 < merge_eps 的簇合并为同一料盘。
-    返回: [(merged_indices, (cx, cy, cz, n_pts)), ...]
-    """
-    if not clusters:
-        return []
-    # 计算每簇的质心和大小
-    infos = []
-    for idx in clusters:
-        c = pts[idx]
-        infos.append({
-            "idx": idx,
-            "cx": float(c[:, 0].mean()),
-            "cy": float(c[:, 1].mean()),
-            "cz": float(c[:, 2].mean()),
-            "n": len(idx),
-            "merged": False,
-        })
-    merged = []
-    for i, a in enumerate(infos):
-        if a["merged"]:
+    for h_low, h_high in intervals:
+        h_low = int(numpy.clip(h_low, 0, H_MAX))
+        h_high = int(numpy.clip(h_high, 0, H_MAX))
+        if h_low > h_high:
             continue
-        group_idx = list(a["idx"])
-        for j in range(i + 1, len(infos)):
-            b = infos[j]
-            if b["merged"]:
-                continue
-            dist = math.hypot(a["cx"] - b["cx"], a["cy"] - b["cy"], a["cz"] - b["cz"])
-            if dist < merge_eps:
-                group_idx.extend(b["idx"])
-                b["merged"] = True
-        a["merged"] = True
-        c_all = pts[group_idx]
-        merged.append((group_idx, (
-            float(c_all[:, 0].mean()),
-            float(c_all[:, 1].mean()),
-            float(c_all[:, 2].mean()),
-            len(group_idx),
-        )))
-    return merged
+        lower = numpy.array([h_low, s_low, v_low], dtype=numpy.uint8)
+        upper = numpy.array([h_high, s_high, v_high], dtype=numpy.uint8)
+        mask = cv2.bitwise_or(mask, cv2.inRange(hsv_image, lower, upper))
 
+    return mask
 
-def _cluster_3d(pts, eps=0.05, min_size=8):
-    """3D 欧氏距离聚类：两点距离 < eps 属同一簇，BFS 连通分量。"""
-    n = len(pts)
-    if n < min_size:
-        return []
-    labels = -np.ones(n, dtype=int)
-    cid = 0
-    for i in range(n):
-        if labels[i] >= 0:
+from sklearn.cluster import DBSCAN
+
+def getCylinderPos(points, normals, axis, radius, eps=0.05, min_samples=10):
+    u = axis / numpy.linalg.norm(axis)
+    ref = numpy.array([1.0, 0.0, 0.0]) if abs(u[0]) < 0.9 else numpy.array([0.0, 1.0, 0.0])
+    e1 = ref - numpy.dot(ref, u) * u
+    e1 = e1 / numpy.linalg.norm(e1)
+    e2 = numpy.cross(u, e1)
+
+    pts_2d = numpy.stack([numpy.dot(points, e1), numpy.dot(points, e2)], axis=1)
+
+    n_dot_axis = numpy.dot(normals, u)
+    normals_perp = normals - n_dot_axis[:, numpy.newaxis] * u
+    norm_perp = numpy.linalg.norm(normals_perp, axis=1)
+    valid_mask = norm_perp > 1e-8
+
+    if not numpy.any(valid_mask):
+        return numpy.array([]), numpy.array([])
+
+    pts_2d_valid = pts_2d[valid_mask]
+    normals_perp_valid = normals_perp[valid_mask]
+    radial_2d = normals_perp_valid / numpy.linalg.norm(normals_perp_valid, axis=1, keepdims=True)
+    centers_2d_est = pts_2d_valid - radius * radial_2d
+
+    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(pts_2d_valid)
+    labels = clustering.labels_
+
+    final_centers_2d = []
+    unique_labels = set(labels)
+    for label in unique_labels:
+        if label == -1:
             continue
-        queue = [i]
-        labels[i] = cid
-        head = 0
-        while head < len(queue):
-            idx = queue[head]
-            head += 1
-            dists = np.linalg.norm(pts - pts[idx], axis=1)
-            for j in np.where((dists < eps) & (labels < 0))[0]:
-                labels[j] = cid
-                queue.append(j)
-        cid += 1
-    clusters = []
-    for ci in range(cid):
-        members = np.where(labels == ci)[0]
-        if len(members) >= min_size:
-            clusters.append(members)
-    return clusters
+        mask_cluster = (labels == label)
+        cluster_pts = pts_2d_valid[mask_cluster]
+        cluster_centers = centers_2d_est[mask_cluster]
 
-
-def scan_rack(lidar, log):
-    """
-    扫描 SMT 货架区域，检测各层有无料盘。
-
-    返回 dict:
-        "shelf_z":    [z0, z1, ...]       搁板高度（世界 Z，米）
-        "normal":     [nx, ny, nz]        货架外法线（≈ 拉出方向）
-        "trays":      [                    按层级排列的料盘列表
-            {"z": 0.75, "slots": [            ← "slots" 里是各槽位料盘质心 (x, y, z)
-                (0.98, 0.35, 0.75), ...
-            ]},
-            {"z": 1.15, "slots": [...]},
-        ]
-    """
-    # ---- 1. 多帧累积扫描：货架整体区域（base_link 坐标系！）----
-    # 机器人起点: 世界 (-0.65, 0, 0.926), base_link = 机器人底盘中心
-    # 货架世界: (1.05, 0, 0), 在 base_link 下: x ≈ 1.70, y ∈ [-0.6, 0.6], z ∈ [-0.9, 0.6]
-    _X0, _Z0 = 0.65, -0.92  # 世界 → base_link 近似偏移
-
-    N_FRAMES = 8
-    all_pts = []
-    for _ in range(N_FRAMES):
-        pts = lidar.get_points_in_region(
-            x_range=(1.00, 2.30), y_range=(-0.80, 0.80), z_range=(-1.00, 0.80))
-        if pts is not None and len(pts) > 0:
-            all_pts.append(pts)
-        rospy.sleep(0.1)
-
-    if not all_pts:
-        _log(log, "激光雷达无数据，检查 /lidar/points 话题")
-        return {"shelf_z": [], "normal": None, "trays": []}
-
-    pts = np.vstack(all_pts)
-    _log(log, "货架区域点云 (%d 帧): %d 点", len(all_pts), len(pts))
-
-    if len(pts) < 200:
-        _log(log, "货架区域点云过少 (n=%d)，放弃", len(pts))
-        return {"shelf_z": [], "normal": None, "trays": []}
-
-    # ---- 2. 拟合搁板平面 & 外法线 ----
-    # 搁板世界 z≈0.40, 1.00 → base_link z ≈ -0.52, 0.08
-    # 围栏世界 z≈0.50, 1.10 → base_link z ≈ -0.42, 0.18
-    shelf_z_candidates = []
-    for z_lo, z_hi in [(-0.60, -0.45), (0.00, 0.20)]:
-        slab = pts[(pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)]
-        if len(slab) > 40:
-            shelf_z_candidates.append(float(slab[:, 2].mean()))
-            _log(log, "  搁板 base_z=%.3f（%d 点）", shelf_z_candidates[-1], len(slab))
-
-    # 平面拟合 → 外法线
-    normal = None
-    shelf_mask = (
-        ((pts[:, 2] >= -0.60) & (pts[:, 2] <= -0.45))
-        | ((pts[:, 2] >= 0.00) & (pts[:, 2] <= 0.20))
-    )
-    shelf_pts = pts[shelf_mask]
-    if len(shelf_pts) >= 30:
-        centroid = shelf_pts.mean(axis=0)
-        _, _, vh = np.linalg.svd(shelf_pts - centroid)
-        normal = vh[2].copy()
-        if normal[0] > 0:
-            normal *= -1.0
-        _log(log, "  货架外法线(base): [%.3f  %.3f  %.3f]", normal[0], normal[1], normal[2])
-
-    # ---- 3. 分层检测料盘 ----
-    # 世界 z ≈ 0.75, 1.15 → base_link z ≈ -0.17, 0.23
-    # 料盘比围栏深（x 更小），围栏在 x≈1.6+
-    level_configs = [
-        # (name,   z_lo,  z_hi,  x_lo, x_hi,  score,  cluster_eps)
-        ("下层",   -0.28,  0.00,  1.35, 1.65,  20,      0.06),
-        ("上层",    0.19,  0.32,  1.35, 1.65,  10,      0.03),
-    ]
-
-    trays_result = []
-
-    for name, z_lo, z_hi, x_lo, x_hi, score, eps in level_configs:
-        layer = pts[
-            (pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)
-            & (pts[:, 0] >= x_lo) & (pts[:, 0] <= x_hi)
-        ]
-        n_layer = len(layer)
-        _log(log, "  %s: z[%.2f,%.2f] x[%.2f,%.2f] → %d 点",
-            name, z_lo, z_hi, x_lo, x_hi, n_layer)
-
-        if n_layer < 10:
-            trays_result.append({"z": (z_lo + z_hi) / 2, "score": score, "slots": [], "n_pts": n_layer})
+        if len(cluster_pts) < min_samples:
             continue
 
-        # 优先 3D 欧氏聚类，回退到 1D Y 间隙聚类
-        clusters = _cluster_3d(layer, eps=eps, min_size=6)
-        if not clusters:
-            clusters = _cluster_1d(layer[:, 1], gap_threshold=0.03, min_size=6)
-
-        # 合并距离过近的碎片簇（单盘被多帧微动切碎的补偿）
-        merged = _merge_clusters(clusters, layer, merge_eps=0.15)
-
-        # 过滤：保留点数 ≥ 25 的大簇（排除围栏等结构碎片）
-        merged = [(idx, info) for idx, info in merged if info[3] >= 25]
-
-        # 按每层预期数量截断（下层 2，上层 3）
-        max_trays = 2 if "下层" in name else 3
-        if len(merged) > max_trays:
-            merged.sort(key=lambda m: -m[1][3])  # 按点数降序
-            merged = merged[:max_trays]
-            merged.sort(key=lambda m: m[1][1])    # 按 y 升序重排
-        clustered = sum(m[1][3] for m in merged)
-        unclustered = n_layer - clustered
-
-        slots = [m[1][:3] for m in merged]  # (cx, cy, cz)
-
-        _log(log, "  %s: %d 个料盘 (eps=%.2fm, clustered=%d unclustered=%d)  →  %d 分/个",
-            name, len(slots), eps, clustered, unclustered, score)
-        for si, (_, (cx, cy, cz, cn)) in enumerate(merged):
-            _log(log, "       [%d] %d点  base_y=%.2f  base_x=%.2f  base_z=%.2f",
-                si, cn, cy, cx, cz)
-
-        # 剩余点的 Y 分布
-        if unclustered > 0 and len(merged) > 0:
-            c_mask = np.zeros(n_layer, dtype=bool)
-            for m_idx, _ in merged:
-                c_mask[m_idx] = True
-            leftover = layer[~c_mask]
-            y_vals = leftover[:, 1]
-            bins = np.arange(y_vals.min() - 0.005, y_vals.max() + 0.015, 0.01)
-            hist, edges = np.histogram(y_vals, bins=bins)
-            peaks = [(edges[i], edges[i+1], hist[i])
-                     for i in np.argsort(hist)[-5:] if hist[i] > 0]
-            log("       未聚类点 Y 分布 (top bins): %s",
-                " | ".join(f"y=[{e1:.2f},{e2:.2f}] n={h}" for e1, e2, h in sorted(peaks, key=lambda x: -x[2])))
-
-        trays_result.append({"z": (z_lo + z_hi) / 2, "score": score, "slots": slots, "n_pts": n_layer})
-
-    return {"shelf_z": shelf_z_candidates, "normal": normal, "trays": trays_result}
-
-
-# ---------------------------------------------------------------------------
-# Debug: challenge_secret 读取真实料盘位姿
-# ---------------------------------------------------------------------------
-
-def _get_gt_trays(log):
-    """通过 challenge_secret.so 获取当前 seed 真实料盘世界坐标。无 .so 时返回 None。"""
-    try:
-        from challenge_secret import get_object_layout
-        layout = get_object_layout("scene3", None)
-        if not layout:
-            return None
-        return {n: (o["pos"][0], o["pos"][1], o["pos"][2])
-                for n, o in layout.items() if n.startswith("smt_tray_")}
-    except Exception:
-        return None
-
-
-def debug_shuffle_seeds(log, rounds=5):
-    """
-    快速遍历多个随机 seed，打印各 seed 的预期料盘位置（base_link 坐标系）。
-    不移动仿真中的真实物体——纯只读，用于验证雷达坐标转换。
-    """
-    try:
-        from challenge_secret import get_object_layout
-    except ImportError:
-        log("challenge_secret 不可用，跳过")
-        return
-
-    import random as _rnd
-    _X0, _Z0 = 0.65, -0.92
-
-    for _ in range(rounds):
-        seed = _rnd.randint(0, 9999)
-        layout = get_object_layout("scene3", seed)
-        if not layout:
-            log("  seed %d: 无布局数据", seed)
+        cov_pts = numpy.cov(cluster_pts.T)
+        eigvals_pts = numpy.linalg.eigvalsh(cov_pts)
+        aspect_ratio = eigvals_pts[1] / (eigvals_pts[0] + 1e-12)
+        if aspect_ratio > 3.0:
             continue
-        trays = [(n, o["pos"]) for n, o in layout.items() if n.startswith("smt_tray_")]
-        lower = [(p[0]+_X0, p[1], p[2]+_Z0) for _, p in trays if abs(p[2] - 0.75) < 0.3]
-        upper = [(p[0]+_X0, p[1], p[2]+_Z0) for _, p in trays if abs(p[2] - 1.15) < 0.3]
-        log("--- seed %d: 下层%d个 上层%d个 ---", seed, len(lower), len(upper))
-        for bx, by, bz in sorted(lower, key=lambda p: p[1]):
-            log("  下  base_y=%.2f  base_x=%.2f  base_z=%.2f", by, bx, bz)
-        for bx, by, bz in sorted(upper, key=lambda p: p[1]):
-            log("  上  base_y=%.2f  base_x=%.2f  base_z=%.2f", by, bx, bz)
 
+        std_dev = numpy.std(cluster_centers, axis=0)
+        if numpy.max(std_dev) > radius * 0.5:
+            continue
 
-def compare_gt(detected, log, gt_trays=None):
-    """对比雷达检测结果 vs 真实位置（坐标统一转 base_link）。"""
-    if not gt_trays:
-        log("  (无 ground truth，跳过对比)")
-        return
-    _X0, _Z0 = 0.65, -0.92
-    det_all = [(cx, cy, cz) for lv in detected["trays"] for cx, cy, cz in lv["slots"]]
-    log("--- GT vs 雷达 ---")
-    for name, (wx, wy, wz) in sorted(gt_trays.items()):
-        bx, by, bz = wx + _X0, wy, wz + _Z0
-        best = min(det_all, key=lambda d: math.hypot(d[0]-bx, d[1]-by, d[2]-bz)) if det_all else None
-        if best:
-            log("  %s: gt=%.2f,%.2f,%.2f  检测=%.2f,%.2f,%.2f  err=%.2fm",
-                name, bx, by, bz, *best, math.hypot(best[0]-bx, best[1]-by, best[2]-bz))
-        else:
-            log("  %s: gt=%.2f,%.2f,%.2f  (未检测到)", name, bx, by, bz)
+        median_center = numpy.median(cluster_centers, axis=0)
+        final_centers_2d.append(median_center)
 
+    if not final_centers_2d:
+        return numpy.array([]), numpy.array([])
 
-# ---------------------------------------------------------------------------
-# 主入口
-# ---------------------------------------------------------------------------
+    final_centers_2d = numpy.array(final_centers_2d)
+    final_centers_3d = (final_centers_2d[:, 0][:, numpy.newaxis] * e1 +
+                        final_centers_2d[:, 1][:, numpy.newaxis] * e2)
+    return final_centers_2d, final_centers_3d
+
+def maskedFuzzyMax(img, mask, channel, epsilon=0):
+    valid = mask > 0
+    ch_data = img[:, :, channel]
+    masked_data = ch_data[valid]
+    max_val = numpy.max(masked_data)
+    threshold = max_val - epsilon
+    condition = (ch_data >= threshold) & valid
+    return numpy.where(condition)
+
+def maskedFuzzyMin(img, mask, channel, epsilon=0):
+    valid = mask > 0
+    ch_data = img[:, :, channel]
+    masked_data = ch_data[valid]
+    min_val = numpy.min(masked_data)
+    threshold = min_val + epsilon
+    condition = (ch_data <= threshold) & valid
+    return numpy.where(condition)
 
 def run_scene3(robot, arm, claw, head, log):
-    """
-    场景三任务主逻辑。
-
-    参数:
-        robot — RobotMover 实例
-        arm   — ArmController 实例
-        claw  — ClawController 实例
-        head  — HeadController 实例
-        log   — 日志函数
-    """
-    print("\n" + "=" * 50)
     log("=" * 50)
-    print("场景三：SMT 料盘出库 — 任务开始")
     log("场景三：SMT 料盘出库 — 任务开始")
-    print("=" * 50)
     log("=" * 50)
 
-    # ============================================================
-    # 第一步：手臂切到外部控制模式
-    # ============================================================
-    log("[STEP 1] 切换手臂到外部控制模式")
-    arm.switch_to_external_control()
-    rospy.sleep(1.0)
-    arm.go_home()
-    log("等待仿真控制器就绪...")
-    rospy.sleep(10.0)  # VRHandCommandNode 需等 MPC+WBC 完整初始化后才处理 arm traj
+    cam = CameraReader()
+    camInfo = rospy.wait_for_message("/cam_h/color/camera_info", CameraInfo)
+    fx = camInfo.K[0]
+    fy = camInfo.K[4]
+    cx = camInfo.K[2]
+    cy = camInfo.K[5]
+    # fovx = numpy.atan(cx / fx) + numpy.atan((width - cx) / fx)
+    # fovy = numpy.atan(cy / fy) + numpy.atan((height - cy) / fy)
 
-    # ============================================================
-    # 第二步：导入感知模块
-    # ============================================================
-    _pkg = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    sys.path.insert(0, os.path.join(_pkg, "src"))
-    from perception_api import LidarReader
+    rate = rospy.Rate(15.0)
 
-    # ============================================================
-    # 第三步：雷达扫描货架 → 检测各层料盘
-    # ============================================================
-    log("[STEP 2] 初始化激光雷达 & 扫描货架区域")
-    lidar = LidarReader()
-    rospy.sleep(0.5)
+    groundTangent = numpy.zeros((3,))
 
-    result = scan_rack(lidar, log)
+    kernel33 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3), anchor=None)
+    kernel55 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5), anchor=None)
+    kernel77 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7), anchor=None)
 
-    # ---- 与真实位置对比 + 多 seed 快速遍历 ----
-    gt = _get_gt_trays(log)
-    compare_gt(result, log, gt)
-    # debug_shuffle_seeds(log, rounds=5)
+    while not rospy.is_shutdown():
+        depth = cam.get_head_depth()
+        # farMask = ((depth <= 10000) & ~numpy.isnan(depth)).astype(numpy.uint8)
+        depth[depth > 10000] = 0
+        validMask = (depth != 0).astype(numpy.uint8)
+        validMask = cv2.erode(validMask, kernel77, iterations=1)
+        cv2.imshow("validMask", validMask * 255)
 
-    # ---- 发布可视化标记 ----
-    publish_tray_markers(result, log)
+        bgr = cam.get_head_rgb()
+        if bgr is None:
+            log("[INFO] bgr is None")
+            rate.sleep()
+            continue
+        if depth is None:
+            log("[INFO] depth is None")
+            rate.sleep()
+            continue
+        pos = depthToPos(depth, fx, fy, cx, cy)
+        normal = posToNormal(pos, depth)
+        normalDotHori, normalDotVert = getNormalDot(normal)
 
-    # ---- 摆头依次看每个料盘 ----
-    look_at_trays(head, log, result, dwell=1.5)
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        groundMask = hsvKey(hsv, [73, 97, 110], [5, 10, 10])
 
-    # ---- 汇总打印 ----
-    log("-" * 40)
-    total_score = 0
-    total_trays = 0
+        cv2.imshow("depth", mulFract(depth, 0.01))
+        cv2.imshow("pos", mulFract(pos, 0.01))
+        cv2.imshow("normal", (normal + 1.0) / 2.0)
 
-    if result["normal"] is not None:
-        n = result["normal"]
-        log("货架外法线（拉出方向）: [%.3f, %.3f, %.3f]", n[0], n[1], n[2])
+        cv2.imshow("normalDotHori", normalDotHori * 500)
+        # cv2.imshow("normalDotVert", normalDotVert * 500)
 
-    for level in result["trays"]:
-        score = level["score"]
-        count = len(level["slots"])
-        total_trays += count
-        total_score += score * count
-        label = "下层[20分]" if score == 20 else "上层[10分]"
-        if count > 0:
-            log("%s (z=%.2fm): %d 个料盘 × %d 分 = %d 分",
-                label, level["z"], count, score, score * count)
-        else:
-            log("%s (z=%.2fm): 空", label, level["z"])
+        detectThreshold = 0.0001
+        normalHoriMask = (normalDotHori > detectThreshold).astype(numpy.uint8) * 255
+        # normalVertMask = (normalDotVert > detectThreshold).astype(numpy.uint8) * 255
 
-    log("-" * 40)
-    log("料盘总数: %d  理论最高分: %d", total_trays, total_score)
-    log("场景三：感知识别完成")
+        normalHoriMask = cv2.erode(normalHoriMask, kernel33, iterations=1)
+        # normalVertMask = cv2.erode(normalVertMask, kernel33, iterations=1)
 
-    # ============================================================
-    # TODO: 后续任务逻辑
-    # ============================================================
-    # 拿到 result["trays"] 后就可以按如下步骤执行：
-    #
-    #   1. 下层优先（20 分/个）：result["trays"][0]["slots"] 是坐标列表，
-    #      对每个坐标 (cx, cy, cz)：
-    #        - 底盘走到货架前，y 对准料盘 y 坐标
-    #        - IK 求解双手预托位姿
-    #        - claw.close() 夹住料盘前缘
-    #        - 沿 result["normal"] 方向后退拉出
-    #        - 抬升到安全高度 → 搬运到出库箱
-    #
-    #   2. 上层（10 分/个）：同样流程，但手臂需要够到 z≈1.15m
+        normalHoriMask = cv2.dilate(normalHoriMask, kernel77, iterations=1)
+        # normalVertMask = cv2.dilate(normalVertMask, kernel77, iterations=1)
+        normalHoriMask = cv2.erode(normalHoriMask, kernel55, iterations=1)
+        # normalVertMask = cv2.erode(normalVertMask, kernel55, iterations=1)
+
+        
+
+        groundVec = normal[groundMask > 0]
+        if numpy.size(groundVec) != 0:
+            groundNormal = getAvgDir(groundVec)
+        groundImg = numpy.dot(normal, groundNormal)
+
+        nonVertMask = (groundImg < 0.2).astype(numpy.uint8) * 255
+        sideVec = normal[nonVertMask > 0]
+        _, _, centers = cv2.kmeans(sideVec.astype(numpy.float32), 3, None, (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 10, 0.001), 10, cv2.KMEANS_PP_CENTERS)
+
+        alignmentThreshold = 0.95
+        kernel77 = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7), anchor=None)
+        nonVertCount = cv2.countNonZero(nonVertMask)
+
+        currentMaxRatio = -1
+        referenceAxis = numpy.array([0.0, 0.0, 1.0])
+        for i in range(3):
+            center = centers[i]
+            center = center / numpy.linalg.norm(center)
+            vecImg = (numpy.dot(normal, center) > alignmentThreshold).astype(numpy.uint8) * 255
+            vecImg = cv2.erode(vecImg, kernel77, iterations=1)
+            correctCount = cv2.countNonZero(vecImg)
+            ratio = correctCount / nonVertCount
+            if ratio > currentMaxRatio:
+                currentMaxRatio = ratio
+                referenceAxis = center
+
+        sideReferenceAxis = numpy.cross(groundNormal, referenceAxis)
+        sideReferenceAxis = sideReferenceAxis / numpy.linalg.norm(sideReferenceAxis)
+        reference = [referenceAxis, sideReferenceAxis, -referenceAxis, -sideReferenceAxis]
+        maxDot = -2.0
+        nextTangent = numpy.zeros((3,))
+        for singleRef in reference:
+            dot = numpy.dot(groundTangent, singleRef)
+            if dot > maxDot:
+                maxDot = dot
+                nextTangent = singleRef
+        groundTangent = nextTangent
+        groundBitangent = numpy.cross(groundNormal, groundTangent)
+        
+        # worldNormal = numpy.stack([
+        #     numpy.sum(normal * groundTangent, axis=-1),
+        #     numpy.sum(normal * groundBitangent, axis=-1),
+        #     numpy.sum(normal * groundNormal, axis=-1)
+        # ], axis=-1)
+        basis = numpy.stack([groundTangent, groundBitangent, groundNormal], axis=-1)  # shape (..., 3, 3)
+        worldNormal = (normal[..., None, :] @ basis).squeeze(-2)
+        worldPos = (pos[..., None, :] @ basis).squeeze(-2)
+        cv2.imshow("worldNormal", (worldNormal + 1.0) / 2.0)
+        cv2.imshow("worldPos", mulFract(worldPos, 0.01))
+
+
+        cv2.imshow("normalDotHori", normalHoriMask)
+        # cv2.imshow("normalDotVert", normalVertMask)
+        bgr = bgr.astype(numpy.float32)
+        turnThreshold = 0.1
+        
+        ROI = validMask.copy()
+        frontFurthest = maskedFuzzyMax(worldPos, validMask, 0, epsilon=200)
+        if numpy.dot(getAvgDir(normal[frontFurthest]), groundNormal) < turnThreshold:
+            # bgr[frontFurthest] = (bgr[frontFurthest] * numpy.array([2, 2, 1]))
+            ROI[frontFurthest] = 0
+        backFurthest = maskedFuzzyMin(worldPos, validMask, 0, epsilon=200)
+        if numpy.dot(getAvgDir(normal[backFurthest]), groundNormal) < turnThreshold:
+            # bgr[backFurthest] = (bgr[backFurthest] * numpy.array([2, 2, 1]))
+            ROI[backFurthest] = 0
+        leftFurthest = maskedFuzzyMin(worldPos, validMask, 1, epsilon=200)
+        if numpy.dot(getAvgDir(normal[leftFurthest]), groundNormal) < turnThreshold:
+            # bgr[leftFurthest] = (bgr[leftFurthest] * numpy.array([2, 2, 1]))  
+            ROI[leftFurthest] = 0
+        rightFurthest = maskedFuzzyMax(worldPos, validMask, 1, epsilon=200)
+        if numpy.dot(getAvgDir(normal[rightFurthest]), groundNormal) < turnThreshold:
+            # bgr[rightFurthest] = (bgr[rightFurthest] * numpy.array([2, 2, 1]))  
+            ROI[rightFurthest] = 0
+        bottomFurthest = maskedFuzzyMax(worldPos, validMask, 2, epsilon=120)
+        # if numpy.dot(getAvgDir(normal[bottomFurthest]), groundNormal) < turnThreshold:
+        # bgr[bottomFurthest] = (bgr[bottomFurthest] * numpy.array([2, 1, 2]))  
+        ROI[bottomFurthest] = 0
+
+        cv2.imshow("ROI", ROI * 255)
+
+        bgr[ROI > 0] = (bgr[ROI > 0] * numpy.array([2, 2, 1]))
+        cv2.imshow("bgr", bgr / 255.0)
+
+        # cv2.imshow("maskedNormal", (normal + 1.0) / 2.0 * (normalHoriMask > 0).astype(numpy.float32)[:, :, numpy.newaxis])
+        # arm.switch_to_external_control()
+        robot.turn_left(angular_speed=0.6)
+        # robot.squat(-0.4)
+        # robot.move_forward(speed=0.4)
+
+
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
+        rate.sleep()
+    cv2.destroyWindow("depth")
+      
+    # -------------------------------------------
 
     log("场景三：任务结束")

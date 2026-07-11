@@ -141,7 +141,13 @@ class CameraReader:
         if msg is None:
             return None
 
-        buf = np.frombuffer(msg.data, dtype=np.uint8)
+        data = msg.data
+        if "compressedDepth" in msg.format and len(data) > 12:
+            # ROS compressed_depth_image_transport stores a 12-byte ConfigHeader
+            # before the PNG payload: int format + two float depth parameters.
+            data = data[12:]
+
+        buf = np.frombuffer(data, dtype=np.uint8)
         raw = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)  # 保持原始 16-bit
 
         if raw is None:
@@ -149,8 +155,8 @@ class CameraReader:
 
         # compressedDepth: 像素值 = depth_mm 的高 12 位 + 低 4 位
         # 实际存储为 16-bit PNG，直接除以 1000 得到米
-        depth_m = raw.astype(np.float32) / 1000.0
-        return depth_m
+        depth = raw.astype(np.float32)
+        return depth
 
 
 # ============================================================
