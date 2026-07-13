@@ -250,6 +250,7 @@ class SensorReader:
 
     用法:
         sensor = SensorReader()
+        t = sensor.get_sim_time()      # 仿真时间 (秒)
         q = sensor.get_joint_q()       # 28 个关节位置 (rad)
         quat = sensor.get_imu_quat()   # IMU 四元数姿态
         acc = sensor.get_imu_acc()     # 加速度 (m/s²)
@@ -263,6 +264,18 @@ class SensorReader:
 
     def _callback(self, msg):
         self._data = msg
+
+    def get_sim_time(self):
+        """返回仿真运行时间，单位 秒。无数据返回 None。"""
+        if self._data is None:
+            return None
+        return self._data.sensor_time.to_sec()
+
+    def get_sim_time_msg(self):
+        """返回原始 ROS Time 仿真时间。无数据返回 None。"""
+        if self._data is None:
+            return None
+        return self._data.sensor_time
 
     def get_joint_q(self):
         """返回 28 个关节位置，单位 弧度。"""
