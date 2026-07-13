@@ -154,6 +154,93 @@ def visualWorld2base(point_world_mm, basis, tf_reader, timeout=1.0):
     return point_base
 
 
+def planTrayApproach(tray_infos, basis, tf_reader, timeout=1.0):
+    """
+    给定所有检测到的料盘信息，计算最优站位和左右手分配，使机器人仅需
+    蹲起 + 手臂微调即可同时够到上下层各一个料盘。
+
+    参数:
+        tray_infos : list of dict，每个元素来自 k-means 聚类后收集的数据：
+            "layer"              : 0 (下层) 或 1 (上层)
+            "y_center_world_mm"  : 视觉世界系 Y 坐标 (mm)
+            "x_center_world_mm"  : 视觉世界系 X 坐标 (mm)
+            "z_top_world_mm"     : 料盘顶面 Z 坐标 (mm)
+        basis       : (3,3) 视觉世界系 basis 矩阵
+        tf_reader   : TFReader 实例
+        timeout     : TF 超时 (秒)
+
+    返回:
+        None (tf 失败或无可用配对时)
+        dict:
+            "y_offset_m"   : 横向移动量 (m)，正值=robot.move_left，负=右移
+            "trays": [
+                {"layer": 0|1, "hand": "left"|"right",
+                 "center_world_mm": (3,) numpy, 视觉世界系中心,
+                 "center_base_m"  : (3,) numpy, base_link 系中心 (m)},
+            ]  共 2 个，分别对应左右手
+    """
+    if not tray_infos:
+        return None
+
+    # ---- 1. 按层分组，变换到 base_link ----
+    trays_by_layer = {0: [], 1: []}
+    for t in tray_infos:
+        center_world = numpy.array([
+            t["x_center_world_mm"],
+            t["y_center_world_mm"],
+            t["z_center_world_mm"],
+        ], dtype=numpy.float32)
+        center_base = visualWorld2base(center_world, basis, tf_reader, timeout)
+        if center_base is None:
+            continue
+        trays_by_layer[t["layer"]].append({
+            "layer": t["layer"],
+            "center_world_mm": center_world,
+            "center_base_m": center_base,
+        })
+
+    # 每层至少有一个料盘才可能配对
+    if not trays_by_layer[0] or not trays_by_layer[1]:
+        return None
+
+    # ---- 2. 枚举跨层配对，找 |ΔY| 最接近肩宽的一对 ----
+    SHOULDER_WIDTH = 0.4  # m, 左右手目标 Y 的理想间隔
+    best_pair = None
+    best_score = float("inf")
+
+    for lo in trays_by_layer[0]:
+        for hi in trays_by_layer[1]:
+            dy = abs(lo["center_base_m"][1] - hi["center_base_m"][1])
+            score = abs(dy - SHOULDER_WIDTH)
+            if score < best_score:
+                best_score = score
+                best_pair = (lo, hi)
+
+    if best_pair is None:
+        return None
+
+    lo, hi = best_pair
+    y_lo = lo["center_base_m"][1]
+    y_hi = hi["center_base_m"][1]
+
+    # 机器人站到两个料盘的 Y 中点
+    y_offset_m = -(y_lo + y_hi) / 2.0
+
+    # 分配: base_link 系 Y 较大的给左手，较小的给右手
+    if y_lo > y_hi:
+        left_tray, right_tray = lo, hi
+    else:
+        left_tray, right_tray = hi, lo
+
+    return {
+        "y_offset_m": float(y_offset_m),
+        "trays": [
+            {**left_tray,  "hand": "left"},
+            {**right_tray, "hand": "right"},
+        ],
+    }
+
+
 def rasterizeSegment(canvas, point0, point1, basis, fx, fy, cx, cy, color=(0, 255, 0), thickness=2, near=1e-4):
     height, width = canvas.shape[:2]
 
@@ -506,6 +593,7 @@ def run_scene3(robot, arm, claw, head, log):
     layerRemainCount = [2, 3]
     phase = "walk_to_shelf"
     initial_tangent = None
+    approach_plan = None
 
     while not rospy.is_shutdown():
         objectBoundingBoxCorners = []
@@ -651,6 +739,7 @@ def run_scene3(robot, arm, claw, head, log):
             layerBottom = [500, 1100]
             layerTop = [900, 1400]
             layerMask = [None, None]
+            tray_infos = []
             for i in range(2):
                 # markAABB(bgr, basis, headFX, headFY, headCX, headCY, [boxFPos + 134, boxLPos + 100, boxDPos + layerBottom[i] + cullDistThreshold], [boxBPos, boxRPos - 100, boxDPos + layerTop[i]])
                 objectBoundingBoxCorners.append([[boxFPos + 134, boxLPos + 100, boxDPos + layerBottom[i] + cullDistThreshold], [boxBPos, boxRPos - 100, boxDPos + layerTop[i]]])
@@ -672,6 +761,13 @@ def run_scene3(robot, arm, claw, head, log):
                     UBoundary = numpy.max(worldPos[targetU, targetV][:, 2])
                     # markAABB(bgr, basis, headFX, headFY, headCX, headCY, [FBoundary, LBoundary, UBoundary + FBoundary - BBoundary], [BBoundary, RBoundary, UBoundary])
                     objectBoundingBoxCorners.append([[FBoundary, LBoundary, UBoundary + FBoundary - BBoundary], [BBoundary, RBoundary, UBoundary]])
+                    tray_infos.append({
+                        "layer": i,
+                        "y_center_world_mm": float(centers[orderMap[j], 0]),
+                        "x_center_world_mm": float((FBoundary + BBoundary) / 2.0),
+                        "z_center_world_mm": float(UBoundary + (FBoundary - BBoundary) / 2.0),
+                        "z_top_world_mm": float(UBoundary),
+                    })
         elif boxClass == 2:
             cullDistThreshold = 50
             targetMask = getAABBMask([boxFPos, boxLPos, boxDPos + boxHeight[boxClass] + cullDistThreshold], [boxBPos, boxRPos, boxDPos + boxHeight[boxClass] + 1000], worldPos).astype(numpy.uint8)
@@ -688,7 +784,11 @@ def run_scene3(robot, arm, claw, head, log):
             goodHeight = [0, 100]
             # markAABB(bgr, basis, headFX, headFY, headCX, headCY, [FBoundary + targetThickNess, LBoundary + targetThickNess, UBoundary + goodHeight[0]], [BBoundary - targetThickNess, RBoundary - targetThickNess, UBoundary + goodHeight[1]])
             objectBoundingBoxCorners.append([[FBoundary + targetThickNess, LBoundary + targetThickNess, UBoundary + goodHeight[0]], [BBoundary - targetThickNess, RBoundary - targetThickNess, UBoundary + goodHeight[1]]])
-        
+
+        # ---- 最优站位规划（保持上次有效结果）----
+        if boxClass == 1:
+            approach_plan = planTrayApproach(tray_infos, basis, tf)
+
         leftBasis, rightBasis = getHandBasis(basis, tf)
         leftOrigin, rightOrigin = getHandOrigin(basis, tf)
 
@@ -710,6 +810,16 @@ def run_scene3(robot, arm, claw, head, log):
         # cv2.imshow("gNormalImg", numpy.dot(normal, groundNormal))
         # cv2.imshow("gTangentImg", numpy.dot(normal, groundTangent))
         # cv2.imshow("gBitangentImg", numpy.dot(normal, groundBitangent))
+        # ---- 头相机红点：标记左右手各自料盘中心 ----
+        if approach_plan is not None:
+            for tray in approach_plan["trays"]:
+                center = numpy.asarray(tray["center_world_mm"], dtype=numpy.float32)
+                p = basis @ center
+                if p[2] > 0:
+                    u = int(round(headFX * p[0] / p[2] + headCX))
+                    v = int(round(headFY * p[1] / p[2] + headCY))
+                    cv2.circle(bgr, (u, v), 10, (0, 0, 255), -1)
+
         cv2.namedWindow("bgr", cv2.WINDOW_GUI_EXPANDED)
         cv2.imshow("bgr", bgr / 255.0)
 
@@ -727,6 +837,23 @@ def run_scene3(robot, arm, claw, head, log):
             rasterizeSegment(Lbgr, LcamFrontPoint, LcamFrontPoint + [0.1, 0, 0], leftBasis, leftFX, leftFY, leftCX, leftCY, [255, 0, 0], 2)
             rasterizeSegment(Lbgr, LcamFrontPoint, LcamFrontPoint + [0, 0, 0.1], leftBasis, leftFX, leftFY, leftCX, leftCY, [0, 255, 0], 2)
 
+            # ---- 手腕相机红点：标记分配给该手的料盘中心 ----
+            if approach_plan is not None:
+                for tray in approach_plan["trays"]:
+                    center = numpy.asarray(tray["center_world_mm"], dtype=numpy.float32)
+                    if tray["hand"] == "left":
+                        p = leftBasis @ (center - leftOrigin)
+                        if p[2] > 0:
+                            u = int(round(leftFX * p[0] / p[2] + leftCX))
+                            v = int(round(leftFY * p[1] / p[2] + leftCY))
+                            cv2.circle(Lbgr, (u, v), 10, (0, 0, 255), -1)
+                    else:
+                        p = rightBasis @ (center - rightOrigin)
+                        if p[2] > 0:
+                            u = int(round(rightFX * p[0] / p[2] + rightCX))
+                            v = int(round(rightFY * p[1] / p[2] + rightCY))
+                            cv2.circle(Rbgr, (u, v), 10, (0, 0, 255), -1)
+
             cv2.namedWindow("leftWristImg", cv2.WINDOW_GUI_EXPANDED)
             cv2.imshow("leftWristImg", Lbgr / 255.0)
             cv2.namedWindow("rightWristImg", cv2.WINDOW_GUI_EXPANDED)
@@ -737,33 +864,73 @@ def run_scene3(robot, arm, claw, head, log):
             if boxClass == 1:
                 print(boxBPos)
                 if abs(boxBPos) > 1000:
-                    robot.move_forward(0.5, (boxFPos/10-50)/0.5)
-                elif abs(boxBPos) > 500:
+                    robot.move_forward(0.3, (boxFPos/10-50)/0.3)
+                elif abs(boxBPos) > 600:
                     robot.move_forward(0.1)
                 else:
                     robot.stop()
-                    phase = "upper_hand_ready"
+                    phase = "side_shift"
             else:
                 robot.stop()
                 log(f"[ERROR] {phase}: shelf not found")
+        
+        if phase == "side_shift":
+            assert(approach_plan)
+
+            y_offset = approach_plan["y_offset_m"]
+            if abs(y_offset) > 0.03:
+                speed = 0.05
+                robot.move_right(speed, duration=y_offset / speed)
+            else:
+                log("[INFO] 已在最优站位，无需侧移")
+            
+            phase = "upper_hand_ready"
+
 
         if phase == "upper_hand_ready":
+            assert(approach_plan)
+
+            # 确定上下层各对应的手，上层抬、下层低位
+            upper_joints = None
+            lower_joints = [0, 0, 0, 0, 0, 0, 0]
+            for tray in approach_plan["trays"]:
+                if tray["layer"] == 1:
+                    upper_joints = tray["hand"]   # 记录"left"或"right"
+
+            if upper_joints is None:
+                log("[ERROR] upper_hand_ready: no upper layer tray in plan")
+                phase = "walk_to_shelf"
+                continue
+
+            selfRadius = 800  # 手臂抬起后遮挡视野，不再依赖当前帧感知
+
             arm.switch_to_external_control()
             rospy.sleep(3.0)
-            arm.go_to_joints([
-                0, 0, 0, 0, 0, 0, 0,  
-                30, 0, 0, -120, 90, 0, 0, 
-            ])
+
+            left_arm  = [0, 0, 0, 0, 0, 0, 0]
+            right_arm = [0, 0, 0, 0, 0, 0, 0]
+
+            if upper_joints == "left":
+                left_arm = [30, 0, 0, -130, -90, 0, 0]
+            else:
+                right_arm = [30, 0, 0, -130, 90, 0, 0]
+            arm.go_to_joints(left_arm + right_arm)
             rospy.sleep(1.0)
-            arm.go_to_joints([
-                0, 0, 0, 0, 0, 0, 0,  
-                0, 0, 0, -120, 90, 0, 0, 
-            ])
+
+            if upper_joints == "left":
+                left_arm = [0, 0, 0, -130, -90, 0, 0]
+            else:
+                right_arm = [0, 0, 0, -130, 90, 0, 0]
+            arm.go_to_joints(left_arm + right_arm)
             rospy.sleep(4.0)
-            arm.go_to_joints([
-                0, 0, 0, 0, 0, 0, 0,  
-                -30, 0, 0, -100, 90, 30, 0, 
-            ])
+
+            if upper_joints == "left":
+                left_arm = [-30, 0, 0, -120, -90, -50, 0]
+            else:
+                right_arm = [-30, 0, 0, -120, 90, 50, 0]
+            arm.go_to_joints(left_arm + right_arm)
+
+            log(f"[INFO] upper_hand_ready: {upper_joints} arm raised for upper layer")
             phase = "grab_upper_smt"
         
         if phase == "grab_upper_smt":
