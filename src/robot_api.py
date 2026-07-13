@@ -20,6 +20,7 @@
     head.look_at(0, -10)                    # 平视、低头 10°
 """
 
+import math
 import time
 import rospy
 from geometry_msgs.msg import Twist
@@ -194,6 +195,7 @@ class ArmController:
 
     def __init__(self):
         self._pub = rospy.Publisher("/kuavo_arm_traj", JointState, queue_size=10)
+        self._last_joints_deg = [0.0] * 14  # 追踪最后发出的关节角
         rospy.sleep(0.1)
 
     # ---- 模式切换 ----
@@ -225,12 +227,14 @@ class ArmController:
         """
         if len(positions) != 14:
             rospy.logerr("go_to_joints 需要 14 个关节值，收到 %d 个", len(positions))
-            return
+            return False
 
         msg = JointState()
         msg.name = self.JOINT_NAMES
         msg.position = list(positions)
+        self._last_joints_deg = list(positions)
         self._pub.publish(msg)
+        return True
 
     def go_home(self):
         """手臂回到初始位置（所有关节归零）。"""
@@ -251,10 +255,11 @@ class ArmController:
         """
         if len(joints) != 7:
             rospy.logerr("left_arm_to 需要 7 个关节值")
-            return
-        full = [0.0] * 14
+            return False
+        # 保留右臂最后一次发送的目标，避免单臂指令把右臂重置为零位。
+        full = list(self._last_joints_deg)
         full[0:7] = joints
-        self.go_to_joints(full)
+        return self.go_to_joints(full)
 
     def right_arm_to(self, joints):
         """
@@ -263,16 +268,36 @@ class ArmController:
         """
         if len(joints) != 7:
             rospy.logerr("right_arm_to 需要 7 个关节值")
-            return
-        full = [0.0] * 14
+            return False
+        # 保留左臂最后一次发送的目标，避免单臂指令把左臂重置为零位。
+        full = list(self._last_joints_deg)
         full[7:14] = joints
-        self.go_to_joints(full)
+        return self.go_to_joints(full)
+
+    def apply_ik_single_arm_solution(self, hand, q_arm_deg):
+        """
+        执行单臂 IK 结果，仅把目标侧的 7 个关节写入控制目标。
+
+        IK 服务仍需要双手位姿作为约束；本方法会丢弃另一侧的求解结果，
+        并保持另一侧最后一次发送的关节目标不变。
+        """
+        if hand not in ("left", "right"):
+            rospy.logerr("apply_ik_single_arm_solution: hand 必须为 left 或 right")
+            return False
+        if len(q_arm_deg) != 14:
+            rospy.logerr("apply_ik_single_arm_solution 需要 14 个 IK 关节值，收到 %d 个", len(q_arm_deg))
+            return False
+        if hand == "left":
+            return self.left_arm_to(q_arm_deg[:7])
+        return self.right_arm_to(q_arm_deg[7:14])
 
     # ---- IK 求解 ----
 
     def solve_ik(self, left_pose_xyz, left_quat_xyzw,
                  right_pose_xyz, right_quat_xyzw,
-                 frame=2, use_current_as_q0=True):
+                 frame=2, use_current_as_q0=True,
+                 use_custom_ik_param=True, pos_cost_weight=0.0,
+                 use_multiple_references=False):
         """
         调用 IK 服务，输入双手末端位姿，返回 14 个关节角度。
 
@@ -283,15 +308,33 @@ class ArmController:
             right_quat_xyzw — 右手末端姿态 [x, y, z, w] 四元数
             frame           — 坐标系: 0=当前 1=odom 2=局部(默认) 3=VR 4=操作世界 5=关节空间
             use_current_as_q0 — 用当前关节角作为初值（通常 True）
+            use_custom_ik_param — 使用高精度 IK 参数
+            pos_cost_weight — 位置成本权重，0.0=最高精度
+            use_multiple_references — 使用多参考点 IK 服务；会额外尝试关节
+                限位中点、伪逆和解析种子，适合从预备姿态抓取目标
 
         返回:
             (success, q_arm) — success 为 True 时 q_arm 是 14 个关节角度(度)
         """
-        rospy.wait_for_service("/ik/two_arm_hand_pose_cmd_srv", timeout=5.0)
+        service_name = ("/ik/two_arm_hand_pose_cmd_srv_muli_refer"
+                        if use_multiple_references
+                        else "/ik/two_arm_hand_pose_cmd_srv")
         try:
-            srv = rospy.ServiceProxy("/ik/two_arm_hand_pose_cmd_srv", twoArmHandPoseCmdSrv)
+            rospy.wait_for_service(service_name, timeout=5.0)
+        except rospy.ROSException:
+            if not use_multiple_references:
+                rospy.logerr("IK 服务不可用: %s", service_name)
+                return False, []
+            rospy.logwarn("多参考点 IK 服务不可用，回退到普通 IK 服务")
+            service_name = "/ik/two_arm_hand_pose_cmd_srv"
+            try:
+                rospy.wait_for_service(service_name, timeout=5.0)
+            except rospy.ROSException:
+                rospy.logerr("IK 服务不可用: %s", service_name)
+                return False, []
+        try:
+            srv = rospy.ServiceProxy(service_name, twoArmHandPoseCmdSrv)
 
-            # 构建左右手姿态
             left_hp = armHandPose()
             left_hp.pos_xyz = list(left_pose_xyz)
             left_hp.quat_xyzw = list(left_quat_xyzw)
@@ -300,33 +343,141 @@ class ArmController:
             right_hp.pos_xyz = list(right_pose_xyz)
             right_hp.quat_xyzw = list(right_quat_xyzw)
 
-            # 构建双手位姿消息
+            if use_current_as_q0:
+                import math
+                left_hp.joint_angles = [math.radians(q) for q in self._last_joints_deg[:7]]
+                right_hp.joint_angles = [math.radians(q) for q in self._last_joints_deg[7:14]]
+
             hand_poses = twoArmHandPose()
             hand_poses.left_pose = left_hp
             hand_poses.right_pose = right_hp
 
-            # 构建请求
             req = twoArmHandPoseCmd()
             req.hand_poses = hand_poses
             req.frame = frame
             req.joint_angles_as_q0 = use_current_as_q0
-            req.use_custom_ik_param = False  # 用默认 IK 参数即可
+            req.use_custom_ik_param = use_custom_ik_param
+            if use_custom_ik_param:
+                req.ik_param.major_optimality_tol = 1e-3
+                req.ik_param.major_feasibility_tol = 1e-3
+                req.ik_param.minor_feasibility_tol = 1e-3
+                req.ik_param.major_iterations_limit = 100
+                req.ik_param.oritation_constraint_tol = 1e-3
+                req.ik_param.pos_constraint_tol = 1e-3
+                req.ik_param.pos_cost_weight = pos_cost_weight
 
             resp = srv(req)
 
             if resp.success:
-                # q_arm 是弧度，转为度
                 import math
                 q_deg = [math.degrees(q) for q in resp.q_arm]
                 rospy.loginfo("IK 求解成功，耗时 %.1f ms", resp.time_cost)
                 return True, q_deg
             else:
-                rospy.logerr("IK 求解失败: %s", resp.error_reason)
+                rospy.logerr("IK 求解失败")
                 return False, []
 
         except rospy.ServiceException as e:
             rospy.logerr("IK 服务调用失败: %s", e)
             return False, []
+
+    def fk(self, joints_deg=None):
+        """
+        正运动学：给定 14 个关节角，返回双手末端位姿。
+
+        参数:
+            joints_deg — 14 个关节角度(度)，默认用最后一次 go_to_joints 的值
+
+        返回:
+            (left_pos, left_quat, right_pos, right_quat), 单位 m
+            失败返回 (None, None, None, None)
+        """
+        if joints_deg is None:
+            joints_deg = self._last_joints_deg
+        import math
+        joints_rad = [math.radians(q) for q in joints_deg]
+
+        rospy.wait_for_service("/ik/fk_srv", timeout=5.0)
+        try:
+            from kuavo_msgs.srv import fkSrv
+            fk_srv = rospy.ServiceProxy("/ik/fk_srv", fkSrv)
+            resp = fk_srv(joints_rad)
+            if resp.success:
+                lp = resp.hand_poses.left_pose.pos_xyz
+                lq = resp.hand_poses.left_pose.quat_xyzw
+                rp = resp.hand_poses.right_pose.pos_xyz
+                rq = resp.hand_poses.right_pose.quat_xyzw
+                return list(lp), list(lq), list(rp), list(rq)
+        except Exception as e:
+            rospy.logerr("FK 调用失败: %s", e)
+        return None, None, None, None
+
+    def solve_ik_single_arm(self, hand, pose_xyz, quat_xyzw, frame=2,
+                            max_error_m=0.03):
+        """
+        单臂 IK：只解指定手，另一只手用 FK 锁定当前位置不动。
+
+        成功后请用 `apply_ik_single_arm_solution()` 执行结果；不要直接将
+        返回的 14 关节结果传给 `go_to_joints()`，以免另一只手被 IK 解改变。
+
+        参数:
+            hand      — "left" 或 "right"
+            pose_xyz  — 目标位置 [x, y, z]，单位 米
+            quat_xyzw — 目标姿态 [x, y, z, w] 四元数
+            frame     — 坐标系 (默认 2=局部/base_link)
+
+        返回:
+            (success, q_arm) — 14 个关节角度(度)
+        """
+        if hand not in ("left", "right"):
+            rospy.logerr("solve_ik_single_arm: hand 必须为 left 或 right")
+            return False, []
+
+        # FK 获取两只手的当前位置，并将非目标手作为硬约束锁定。
+        lp, lq, rp, rq = self.fk()
+        if lp is None:
+            rospy.logerr("solve_ik_single_arm: FK 失败，无法安全锁定非目标手")
+            return False, []
+
+        if hand == "left":
+            # 右手锁定当前位姿。
+            ok, q_arm = self.solve_ik(
+                pose_xyz, quat_xyzw, rp, rq, frame=frame,
+                use_current_as_q0=True, pos_cost_weight=0.0,
+                use_multiple_references=True)
+        else:
+            # 左手锁定当前位姿。
+            ok, q_arm = self.solve_ik(
+                lp, lq, pose_xyz, quat_xyzw, frame=frame,
+                use_current_as_q0=True, pos_cost_weight=0.0,
+                use_multiple_references=True)
+
+        if not ok:
+            return False, []
+
+        # IK 服务在目标超出工作空间时仍可能返回 success=True 和一组饱和
+        # 关节角。必须用 FK 验证目标侧的位置误差，避免执行明显偏离的解。
+        solved_lp, _, solved_rp, _ = self.fk(q_arm)
+        solved_pos = solved_lp if hand == "left" else solved_rp
+        if solved_pos is None:
+            rospy.logerr("solve_ik_single_arm: 无法验证 IK 解的 FK 结果")
+            return False, []
+
+        target_xyz = [float(value) for value in pose_xyz]
+        solved_xyz = [float(value) for value in solved_pos]
+        error_xyz = [actual - target for actual, target in zip(solved_xyz, target_xyz)]
+        error_m = math.sqrt(sum(component ** 2 for component in error_xyz))
+        rospy.loginfo(
+            "[DEBUG] solve_ik_single_arm: hand=%s frame=%s target_m=%s solved_m=%s "
+            "error_m=%s norm_mm=%.1f q0_deg=%s q_solution_deg=%s",
+            hand, frame, target_xyz, solved_xyz, error_xyz, error_m * 1000.0,
+            self._last_joints_deg, q_arm)
+        if error_m > max_error_m:
+            rospy.logerr("solve_ik_single_arm: IK 残差 %.1f mm > %.0f mm，拒绝执行",
+                         error_m * 1000.0, max_error_m * 1000.0)
+            return False, []
+
+        return True, q_arm
 
 
 # ============================================================
@@ -394,11 +545,20 @@ class ClawController:
 
     # ---- 状态查询 ----
 
-    def is_grabbed(self):
+    def is_grabbed(self, hand=None):
         """
-        判断是否抓住了物体。
-        只要任一侧夹爪状态为 3 (Grabbed) 就返回 True。
+        判断夹爪是否抓住了物体。
+
+        hand 为 "left" 或 "right" 时仅检查指定侧；默认只要任一侧状态为
+        3 (Grabbed) 就返回 True。
         """
+        if hand == "left":
+            return self._left_state == 3
+        if hand == "right":
+            return self._right_state == 3
+        if hand is not None:
+            rospy.logerr("is_grabbed: hand 必须为 left、right 或 None")
+            return False
         return self._left_state == 3 or self._right_state == 3
 
     def is_moving(self):

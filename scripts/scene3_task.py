@@ -134,10 +134,11 @@ def visualWorld2base(point_world_mm, basis, tf_reader, timeout=1.0):
     if point_world_mm.shape != (3,):
         raise ValueError(f"point_world_mm 需要 shape (3,), 收到 {point_world_mm.shape}")
 
-    # 1. 视觉世界系 → 头部相机光学系
-    # worldPos = pos @ basis  →  pos = worldPos @ basis^T
-    # 单个点: P_head_cam = basis @ P_world (列向量) = P_world @ basis^T (行向量)
-    point_head_cam_mm = point_world_mm @ basis.T  # shape (3,) in mm
+    # 1. 视觉世界系 → 头部相机光学系。
+    # worldPos = pos @ basis；groundTangent 与 groundNormal 仅近似正交，
+    # 因此必须用真正的逆矩阵，不能把 basis.T 当作逆。
+    basis = numpy.asarray(basis, dtype=numpy.float32)
+    point_head_cam_mm = point_world_mm @ numpy.linalg.inv(basis)  # shape (3,) in mm
 
     # 2. TF 查询: 头部相机在 base_link 系下的位姿
     head_pos, head_quat = tf_reader.lookup("base_link", HEAD_CAMERA_FRAME, timeout=timeout)
@@ -223,8 +224,10 @@ def planTrayApproach(tray_infos, basis, tf_reader, timeout=1.0):
     y_lo = lo["center_base_m"][1]
     y_hi = hi["center_base_m"][1]
 
-    # 机器人站到两个料盘的 Y 中点
-    y_offset_m = -(y_lo + y_hi) / 2.0
+    # 初始站位仅将上层料盘移到目标手一侧；抬臂后必须根据真实 wrist optical
+    # TF 将料盘投影到腕相机，并在像素平面闭环精调，不能硬编码手宽。
+    upper_hand = "left" if y_hi > y_lo else "right"
+    y_offset_m = y_hi
 
     # 分配: base_link 系 Y 较大的给左手，较小的给右手
     if y_lo > y_hi:
@@ -234,6 +237,8 @@ def planTrayApproach(tray_infos, basis, tf_reader, timeout=1.0):
 
     return {
         "y_offset_m": float(y_offset_m),
+        "upper_hand": upper_hand,
+        "upper_target_base_y_m": float(y_hi),
         "trays": [
             {**left_tray,  "hand": "left"},
             {**right_tray, "hand": "right"},
@@ -594,6 +599,12 @@ def run_scene3(robot, arm, claw, head, log):
     phase = "walk_to_shelf"
     initial_tangent = None
     approach_plan = None
+    upper_tray = None
+    upper_hand = None
+    coarse_target_base_m = None
+    arm_is_raised = False
+    wrist_alignment_attempts = 0
+    grab_subphase = 0
 
     while not rospy.is_shutdown():
         objectBoundingBoxCorners = []
@@ -602,6 +613,8 @@ def run_scene3(robot, arm, claw, head, log):
         bgr = cam.get_head_rgb()
         Rbgr = cam.get_right_wrist_rgb()
         Lbgr = cam.get_left_wrist_rgb()
+        Rdepth = cam.get_right_wrist_depth()
+        Ldepth = cam.get_left_wrist_depth()
         if bgr is None:
             log("[INFO] bgr is None")
             rate.sleep()
@@ -864,8 +877,8 @@ def run_scene3(robot, arm, claw, head, log):
             if boxClass == 1:
                 print(boxBPos)
                 if abs(boxBPos) > 1000:
-                    robot.move_forward(0.3, (boxFPos/10-50)/0.3)
-                elif abs(boxBPos) > 600:
+                    robot.move_forward(0.3, (boxFPos/10-45)/0.3)
+                elif abs(boxBPos) > 500:
                     robot.move_forward(0.1)
                 else:
                     robot.stop()
@@ -878,9 +891,17 @@ def run_scene3(robot, arm, claw, head, log):
             assert(approach_plan)
 
             y_offset = approach_plan["y_offset_m"]
+            log("[INFO] side_shift: upper hand=%s, upper target Y=%.3fm, hand Y=%.3fm, move=%.3fm" % (
+                approach_plan["upper_hand"],
+                approach_plan["upper_target_base_y_m"],
+                0.0,
+                y_offset))
             if abs(y_offset) > 0.03:
                 speed = 0.05
-                robot.move_right(speed, duration=y_offset / speed)
+                if y_offset > 0:
+                    robot.move_left(speed, duration=abs(y_offset) / speed)
+                else:
+                    robot.move_right(speed, duration=abs(y_offset) / speed)
             else:
                 log("[INFO] 已在最优站位，无需侧移")
             
@@ -892,17 +913,26 @@ def run_scene3(robot, arm, claw, head, log):
 
             # 确定上下层各对应的手，上层抬、下层低位
             upper_joints = None
-            lower_joints = [0, 0, 0, 0, 0, 0, 0]
+            upper_tray = None
             for tray in approach_plan["trays"]:
                 if tray["layer"] == 1:
-                    upper_joints = tray["hand"]   # 记录"left"或"right"
+                    upper_joints = tray["hand"]
+                    upper_tray = tray
 
-            if upper_joints is None:
+            if upper_joints is None or upper_tray is None:
                 log("[ERROR] upper_hand_ready: no upper layer tray in plan")
                 phase = "walk_to_shelf"
                 continue
 
-            selfRadius = 800  # 手臂抬起后遮挡视野，不再依赖当前帧感知
+            # 手臂抬起后会进入头相机 ROI；扩大自遮挡半径，后续只依赖腕相机。
+            selfRadius = 800
+            arm_is_raised = True
+            upper_hand = upper_joints
+            coarse_target_base_m = numpy.asarray(upper_tray["center_base_m"], dtype=numpy.float32)
+            # upper_tray.center_base_m 是侧移前头相机算出的 base_link 坐标；
+            # 机器人侧移 d (y_offset_m) 后，世界不动目标在新 base 的 Y 减小 d。
+            coarse_target_base_m[1] -= float(approach_plan["y_offset_m"])
+            claw.left_open() if upper_hand == "left" else claw.right_open()
 
             arm.switch_to_external_control()
             rospy.sleep(3.0)
@@ -911,30 +941,246 @@ def run_scene3(robot, arm, claw, head, log):
             right_arm = [0, 0, 0, 0, 0, 0, 0]
 
             if upper_joints == "left":
-                left_arm = [30, 0, 0, -130, -90, 0, 0]
+                left_arm = [50, 0, 0, -160, -90, 0, 0]
             else:
-                right_arm = [30, 0, 0, -130, 90, 0, 0]
+                right_arm = [50, 0, 0, -160, 90, 0, 0]
             arm.go_to_joints(left_arm + right_arm)
             rospy.sleep(1.0)
 
             if upper_joints == "left":
-                left_arm = [0, 0, 0, -130, -90, 0, 0]
+                left_arm = [0, 0, 0, -150, -90, 0, 0]
             else:
-                right_arm = [0, 0, 0, -130, 90, 0, 0]
+                right_arm = [0, 0, 0, -150, 90, 0, 0]
             arm.go_to_joints(left_arm + right_arm)
             rospy.sleep(4.0)
 
             if upper_joints == "left":
-                left_arm = [-30, 0, 0, -120, -90, -50, 0]
+                left_arm = [-30, 0, 0, -130, -90, -60, 0]
             else:
-                right_arm = [-30, 0, 0, -120, 90, 50, 0]
+                right_arm = [-30, 0, 0, -130, 90, 60, 0]
             arm.go_to_joints(left_arm + right_arm)
 
+            rospy.sleep(2.0)
             log(f"[INFO] upper_hand_ready: {upper_joints} arm raised for upper layer")
-            phase = "grab_upper_smt"
+            wrist_alignment_attempts = 0
+            grab_subphase = 0
+            phase = "align_upper_wrist"
+
+        if phase == "align_upper_wrist":
+            if upper_hand is None or coarse_target_base_m is None:
+                log("[ERROR] align_upper_wrist: missing upper tray target")
+                continue
+
+            wrist_frame = LEFT_WRIST_CAMERA_FRAME if upper_hand == "left" else RIGHT_WRIST_CAMERA_FRAME
+            fx, fy, cx, cy = ((leftFX, leftFY, leftCX, leftCY) if upper_hand == "left"
+                              else (rightFX, rightFY, rightCX, rightCY))
+            wrist_pos, wrist_quat = tf.lookup("base_link", wrist_frame)
+            if wrist_pos is None or wrist_quat is None:
+                log("[INFO] align_upper_wrist: waiting for wrist TF")
+                continue
+
+            # base → wrist link → wrist optical. optical 与 link 的坐标轴修正与
+            # getHandBasis() 保持一致；料盘预测像素才是腕相机对齐的唯一判据。
+            R_wrist_to_base = quatToRotMatrix(wrist_quat)
+            point_wrist_link = R_wrist_to_base.T @ (
+                numpy.asarray(coarse_target_base_m, dtype=numpy.float32)
+                - numpy.asarray(wrist_pos, dtype=numpy.float32))
+            point_wrist_optical = numpy.diag([1.0, -1.0, -1.0]) @ point_wrist_link
+            if point_wrist_optical[2] <= 0.05:
+                log("[WARN] align_upper_wrist: upper tray behind wrist camera: %s" %
+                    numpy.array2string(point_wrist_optical, precision=4))
+                continue
+
+            u_pred = fx * point_wrist_optical[0] / point_wrist_optical[2] + cx
+            v_pred = fy * point_wrist_optical[1] / point_wrist_optical[2] + cy
+            du = u_pred - cx
+            log("[INFO] align_upper_wrist: hand=%s coarse_base=%s optical=%s pixel=(%.1f,%.1f) center=(%.1f,%.1f) du=%.1f attempt=%d" % (
+                upper_hand, numpy.array2string(coarse_target_base_m, precision=4),
+                numpy.array2string(point_wrist_optical, precision=4),
+                u_pred, v_pred, cx, cy, du, wrist_alignment_attempts))
+
+            if abs(du) <= 25.0 or wrist_alignment_attempts >= 4:
+                if wrist_alignment_attempts >= 4:
+                    log("[WARN] align_upper_wrist: attempt limit reached; refine at projected ROI")
+                else:
+                    log("[INFO] align_upper_wrist: upper tray centered")
+                phase = "grab_upper_smt"
+                continue
+
+            # optical X=right。当料盘在画面右侧(du>0)时，机器人右移(即料盘
+            # 相对机器人向左)才能让它在画面中往中心靠拢。
+            shift_m = numpy.clip(abs(du) * point_wrist_optical[2] / fx, 0.02, 0.08)
+            if du > 0:
+                robot.move_right(0.04, duration=shift_m / 0.04)
+                coarse_target_base_m[1] += shift_m
+            else:
+                robot.move_left(0.04, duration=shift_m / 0.04)
+                coarse_target_base_m[1] -= shift_m
+            wrist_alignment_attempts += 1
+            rospy.sleep(1.0)
+            continue
         
         if phase == "grab_upper_smt":
-            pass
+            if upper_hand is None or coarse_target_base_m is None:
+                log("[ERROR] grab_upper_smt: missing upper tray approach target")
+                continue
+
+            lp, lq, rp, rq = arm.fk()
+            grasp_quat = lq if upper_hand == "left" else rq
+            if grasp_quat is None:
+                log("[ERROR] grab_upper_smt: FK unavailable")
+                continue
+
+            wrist_frame = LEFT_WRIST_CAMERA_FRAME if upper_hand == "left" else RIGHT_WRIST_CAMERA_FRAME
+            wrist_depth_data = Ldepth if upper_hand == "left" else Rdepth
+            fx, fy, cx, cy = ((leftFX, leftFY, leftCX, leftCY) if upper_hand == "left"
+                              else (rightFX, rightFY, rightCX, rightCY))
+
+            if grab_subphase == 0:
+                # 第一阶段只到安全预抓取点：沿 -X（朝机器人）回撤 22cm。
+                # 这一段即使关节轨迹有侧向弧线也远离料盘；真正靠近料盘的下一段
+                # 会保持 Y/Z 不变，只沿机器人面朝的 +X 方向伸出。
+                target_base_m = coarse_target_base_m.copy()
+                target_base_m[0] -= 0.22
+                target_base_m[2] += 0.10
+                # 不能线性插值关节角：日志已证明它使 EEF Y 从 0.17 → 0.10 →
+                # 0.24 大幅摆动。逐个求解笛卡尔直线路点，才约束末端按直线走。
+                start_eef = numpy.asarray(lp if upper_hand == "left" else rp, dtype=numpy.float32)
+                log("[DEBUG] grab_upper_smt: phase0 cartesian path start=%s target=%s" % (
+                    numpy.array2string(start_eef, precision=4),
+                    numpy.array2string(target_base_m, precision=4)))
+                path_ok = True
+                for frac in (0.2, 0.4, 0.6, 0.8, 1.0):
+                    cart_waypoint = start_eef + (target_base_m - start_eef) * frac
+                    ok, q_waypoint = arm.solve_ik_single_arm(
+                        upper_hand, cart_waypoint, grasp_quat, frame=2, max_error_m=0.05)
+                    if not ok:
+                        log("[ERROR] grab_upper_smt: phase0 cartesian waypoint %.0f%% IK failed" %
+                            (frac * 100))
+                        path_ok = False
+                        break
+                    wp_lp, _, wp_rp, _ = arm.fk(q_waypoint)
+                    wp_eef = wp_lp if upper_hand == "left" else wp_rp
+                    wp_joints = q_waypoint[:7] if upper_hand == "left" else q_waypoint[7:]
+                    log("[DEBUG] grab_upper_smt: phase0 waypoint %.0f%% desired_m=%s joints_deg=%s fk_eef_m=%s" % (
+                        frac * 100, numpy.array2string(cart_waypoint, precision=4),
+                        numpy.array2string(numpy.asarray(wp_joints), precision=2),
+                        numpy.array2string(numpy.asarray(wp_eef), precision=4)))
+                    arm.apply_ik_single_arm_solution(upper_hand, q_waypoint)
+                    rospy.sleep(1.5)
+                if not path_ok:
+                    rospy.sleep(0.2)
+                    continue
+                grab_subphase = 1
+                continue
+
+            if grab_subphase == 1:
+                # 第二阶段：必须用 phase0 结束时的实际 FK Y/Z 作为起点，
+                # target Y/Z = 实际 Y/Z（不变），只有 X 前伸到 coarse-0.10。
+                phase1_lp, _, phase1_rp, _ = arm.fk()
+                phase1_start = numpy.asarray(
+                    phase1_lp if upper_hand == "left" else phase1_rp, dtype=numpy.float32)
+                target_base_m = phase1_start.copy()
+                target_base_m[0] = float(coarse_target_base_m[0] - 0.10)
+                log("[DEBUG] grab_upper_smt: phase1 cartesian forward phase1_start=%s target=%s" % (
+                    numpy.array2string(phase1_start, precision=4),
+                    numpy.array2string(target_base_m, precision=4)))
+                path_ok = True
+                for frac in (0.2, 0.4, 0.6, 0.8, 1.0):
+                    cart_waypoint = phase1_start + (target_base_m - phase1_start) * frac
+                    ok, q_waypoint = arm.solve_ik_single_arm(
+                        upper_hand, cart_waypoint, grasp_quat, frame=2, max_error_m=0.05)
+                    if not ok:
+                        log("[ERROR] grab_upper_smt: phase1 cartesian waypoint %.0f%% IK failed" %
+                            (frac * 100))
+                        path_ok = False
+                        break
+                    wp_lp, _, wp_rp, _ = arm.fk(q_waypoint)
+                    wp_eef = wp_lp if upper_hand == "left" else wp_rp
+                    wp_joints = q_waypoint[:7] if upper_hand == "left" else q_waypoint[7:]
+                    log("[DEBUG] grab_upper_smt: phase1 waypoint %.0f%% desired_m=%s joints_deg=%s fk_eef_m=%s" % (
+                        frac * 100, numpy.array2string(cart_waypoint, precision=4),
+                        numpy.array2string(numpy.asarray(wp_joints), precision=2),
+                        numpy.array2string(numpy.asarray(wp_eef), precision=4)))
+                    arm.apply_ik_single_arm_solution(upper_hand, q_waypoint)
+                    rospy.sleep(1.5)
+                if not path_ok:
+                    rospy.sleep(0.2)
+                    continue
+                grab_subphase = 2
+                continue
+
+            # 第三阶段：腕相机中心 ROI 做精细 Z 向微调。前两段已完成安全靠近，
+            # 此时腕相机中心应直接看到料盘；取中心70×70 ROI 的中位深度。
+            if wrist_depth_data is None:
+                log("[INFO] grab_upper_smt: waiting for wrist depth")
+                continue
+
+            h, w = wrist_depth_data.shape[:2]
+            u0, u1 = max(0, w // 2 - 35), min(w, w // 2 + 35)
+            v0, v1 = max(0, h // 2 - 35), min(h, h // 2 + 35)
+            roi_depth = wrist_depth_data[v0:v1, u0:u1].astype(numpy.float32)
+            valid_mask = (roi_depth > 50.0) & (roi_depth < 700.0) & ~numpy.isnan(roi_depth)
+            valid_depth = roi_depth[valid_mask]
+            if valid_depth.size < 200:
+                dmin = float(numpy.min(roi_depth)) if roi_depth.size > 0 else -1
+                dmax = float(numpy.max(roi_depth)) if roi_depth.size > 0 else -1
+                log("[INFO] grab_upper_smt: wrist center depth not stable (valid=%d, min=%.1f max=%.1f)" %
+                    (valid_depth.size, dmin, dmax))
+                continue
+
+            z_mm = float(numpy.median(valid_depth))
+            log("[DEBUG] grab_upper_smt: phase1 wrist center depth=%.1fmm" % z_mm)
+
+            # 腕相机光学中心射线在 base_link 的方向 = wrist TF 旋转矩阵的第三列
+            # （光学 Z=前），经 diag(1,-1,-1) 修正到 link 坐标后再用 TF 旋转。
+            wrist_pos, wrist_quat = tf.lookup("base_link", wrist_frame)
+            if wrist_pos is None or wrist_quat is None:
+                log("[INFO] grab_upper_smt: waiting for wrist TF")
+                continue
+            optical_to_link = numpy.diag([1.0, -1.0, -1.0])
+            R_wrist_to_base = quatToRotMatrix(wrist_quat)
+            # 光学中心射线方向: 光学 Z=[0,0,1] → link Z via optical_to_link = [0,0,-1]
+            # 再用 R_wrist_to_base 转到 base_link
+            forward_link = optical_to_link @ numpy.array([0.0, 0.0, 1.0])
+            forward_base = R_wrist_to_base @ forward_link
+            # 料盘位置 = 腕相机原点 + 深度 × 前向单位向量
+            target_base_m = numpy.asarray(wrist_pos, dtype=numpy.float32) + forward_base * (z_mm / 1000.0)
+            # 用粗定位的 XY 作为横向约束，避免中心深度射线落点到料盘以外的平面上
+            target_base_m[0] = float(coarse_target_base_m[0])
+            target_base_m[1] = float(coarse_target_base_m[1])
+            log("[DEBUG] grab_upper_smt: phase1 fine target=%s" %
+                numpy.array2string(target_base_m, precision=4))
+            ok, q_arm = arm.solve_ik_single_arm(upper_hand, target_base_m, grasp_quat, frame=2)
+            if not ok:
+                log("[ERROR] grab_upper_smt: fine IK failed; retrying")
+                rospy.sleep(0.2)
+                continue
+
+            # 精细微调同样先保存当前关节，随后分步下发，不能先直达终点。
+            current_q = list(arm._last_joints_deg)
+            for frac in (0.33, 0.66, 1.0):
+                waypoint = [c + (t - c) * frac for c, t in zip(current_q, q_arm)]
+                wp_lp, _, wp_rp, _ = arm.fk(waypoint)
+                wp_eef = wp_lp if upper_hand == "left" else wp_rp
+                wp_joints = waypoint[:7] if upper_hand == "left" else waypoint[7:]
+                log("[DEBUG] grab_upper_smt: phase2 waypoint %.0f%% joints_deg=%s fk_eef_m=%s" % (
+                    frac * 100, numpy.array2string(numpy.asarray(wp_joints), precision=2),
+                    numpy.array2string(numpy.asarray(wp_eef), precision=4)))
+                arm.apply_ik_single_arm_solution(upper_hand, waypoint)
+                rospy.sleep(1.5)
+            if upper_hand == "left":
+                claw.left_close()
+            else:
+                claw.right_close()
+            claw.wait_until_done(3.0)
+            if claw.is_grabbed(upper_hand):
+                log(f"[INFO] grab_upper_smt: {upper_hand} upper tray grabbed")
+                phase = "upper_grabbed"
+            else:
+                log("[WARN] grab_upper_smt: claw did not report a grasp; retrying")
+                grab_subphase = 0
+                rospy.sleep(0.5)
 
 
 
