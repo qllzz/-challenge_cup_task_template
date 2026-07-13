@@ -141,7 +141,13 @@ class CameraReader:
         if msg is None:
             return None
 
-        buf = np.frombuffer(msg.data, dtype=np.uint8)
+        data = msg.data
+        if "compressedDepth" in msg.format and len(data) > 12:
+            # ROS compressed_depth_image_transport stores a 12-byte ConfigHeader
+            # before the PNG payload: int format + two float depth parameters.
+            data = data[12:]
+
+        buf = np.frombuffer(data, dtype=np.uint8)
         raw = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)  # 保持原始 16-bit
 
         if raw is None:
@@ -149,8 +155,8 @@ class CameraReader:
 
         # compressedDepth: 像素值 = depth_mm 的高 12 位 + 低 4 位
         # 实际存储为 16-bit PNG，直接除以 1000 得到米
-        depth_m = raw.astype(np.float32) / 1000.0
-        return depth_m
+        depth = raw.astype(np.float32)
+        return depth
 
 
 # ============================================================
@@ -244,6 +250,7 @@ class SensorReader:
 
     用法:
         sensor = SensorReader()
+        t = sensor.get_sim_time()      # 仿真时间 (秒)
         q = sensor.get_joint_q()       # 28 个关节位置 (rad)
         quat = sensor.get_imu_quat()   # IMU 四元数姿态
         acc = sensor.get_imu_acc()     # 加速度 (m/s²)
@@ -257,6 +264,18 @@ class SensorReader:
 
     def _callback(self, msg):
         self._data = msg
+
+    def get_sim_time(self):
+        """返回仿真运行时间，单位 秒。无数据返回 None。"""
+        if self._data is None:
+            return None
+        return self._data.sensor_time.to_sec()
+
+    def get_sim_time_msg(self):
+        """返回原始 ROS Time 仿真时间。无数据返回 None。"""
+        if self._data is None:
+            return None
+        return self._data.sensor_time
 
     def get_joint_q(self):
         """返回 28 个关节位置，单位 弧度。"""

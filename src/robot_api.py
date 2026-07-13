@@ -49,6 +49,7 @@ class RobotMover:
 
     def __init__(self):
         self._pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+        self._pose_pub = rospy.Publisher("/cmd_pose", Twist, queue_size=10)
         self._gait_pub = rospy.Publisher("/humanoid_mpc_gait_change", String, queue_size=10)
         rospy.sleep(0.1)
 
@@ -109,6 +110,26 @@ class RobotMover:
         """
         self._publish(forward, left, 0.0, turn, duration)
 
+    # ---- 躯干高度控制 ----
+
+    def squat(self, height_delta, repeat=10, interval=0.05):
+        """
+        调整躯干高度。height_delta 是相对标称高度 /com_height 的增量，单位 m。
+
+        例如: robot.squat(-0.10) → 下蹲 10cm。
+        不做高度限位，调用者需要自己保证输入安全。
+        """
+        self._publish_pose_height(height_delta, repeat, interval)
+
+    def stand_height(self, height_delta=0.0, repeat=10, interval=0.05):
+        """
+        设置躯干高度增量。默认 0.0 表示恢复到标称高度 /com_height。
+
+        例如: robot.stand_height(0.0) → 恢复标称高度。
+        不做高度限位，调用者需要自己保证输入安全。
+        """
+        self._publish_pose_height(height_delta, repeat, interval)
+
     # ---- 内部方法 ----
 
     @staticmethod
@@ -133,6 +154,13 @@ class RobotMover:
                 self._pub.publish(twist)
                 rate.sleep()
             self.stop()
+
+    def _publish_pose_height(self, height_delta, repeat, interval):
+        """发布 /cmd_pose 高度增量指令。"""
+        twist = self._make_twist(0.0, 0.0, height_delta, 0.0)
+        for _ in range(repeat):
+            self._pose_pub.publish(twist)
+            rospy.sleep(interval)
 
 
 # ============================================================
