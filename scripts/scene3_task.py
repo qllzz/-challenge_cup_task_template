@@ -504,8 +504,7 @@ def run_scene3(robot, arm, claw, head, log):
     kernel77 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7), anchor=None)
 
     layerRemainCount = [2, 3]
-    phase = "turn"
-    phase_time = None
+    phase = "walk_to_shelf"
     initial_tangent = None
 
     while not rospy.is_shutdown():
@@ -616,7 +615,7 @@ def run_scene3(robot, arm, claw, head, log):
         bgr[downFurthest] = (bgr[downFurthest] * numpy.array([2, 1, 2]))  
         ROI[downFurthest] = 0
 
-        selfRadius = 800
+        selfRadius = 400
         selfRadiusSquare = selfRadius * selfRadius
         ROI[numpy.square(worldPos[:, :, 0]) + numpy.square(worldPos[:, :, 1]) < selfRadiusSquare] = 0
 
@@ -734,38 +733,43 @@ def run_scene3(robot, arm, claw, head, log):
             cv2.imshow("rightWristImg", Rbgr / 255.0)
 
 
-        if phase == "turn":
-            if phase_time is None:
-                phase_time = sensor.get_sim_time()
-                initial_tangent = groundTangent.copy()          # ← 保存第一帧的初始方向
-
-            robot.turn_left(0.5) # 不能转太快
-
-            cos_angle = numpy.dot(initial_tangent, groundTangent)
-            # cos(π) ≈ -1, 给一点容差，< -0.95 就认为转了约 180°
-            if cos_angle < -0.95 or sensor.get_sim_time() - phase_time > 15.0:
-                robot.stop()
-                log(f"[INFO] 转身完成: dot={cos_angle:.3f}, 耗时 {sensor.get_sim_time() - phase_time:.1f}s")
-                phase = "walk_to_table"
-                phase_time = None
-        
-        if phase == "walk_to_table":
-            if boxClass == 2: # 桌子
-                if boxFPos > 600:
-                    robot.move_forward(0.5)
-                    print(boxFPos)
+        if phase == "walk_to_shelf":
+            if boxClass == 1:
+                print(boxBPos)
+                if abs(boxBPos) > 1000:
+                    robot.move_forward(0.5, (boxFPos/10-50)/0.5)
+                elif abs(boxBPos) > 500:
+                    robot.move_forward(0.1)
                 else:
                     robot.stop()
+                    phase = "upper_hand_ready"
             else:
-                log(f"[ERROR] {phase}: table not found!")
                 robot.stop()
+                log(f"[ERROR] {phase}: shelf not found")
 
-        #arm.switch_to_external_control()
+        if phase == "upper_hand_ready":
+            arm.switch_to_external_control()
+            rospy.sleep(3.0)
+            arm.go_to_joints([
+                0, 0, 0, 0, 0, 0, 0,  
+                30, 0, 0, -120, 90, 0, 0, 
+            ])
+            rospy.sleep(1.0)
+            arm.go_to_joints([
+                0, 0, 0, 0, 0, 0, 0,  
+                0, 0, 0, -120, 90, 0, 0, 
+            ])
+            rospy.sleep(4.0)
+            arm.go_to_joints([
+                0, 0, 0, 0, 0, 0, 0,  
+                -30, 0, 0, -100, 90, 30, 0, 
+            ])
+            phase = "grab_upper_smt"
+        
+        if phase == "grab_upper_smt":
+            pass
 
-        #arm.go_to_joints([
-        #    -70, 0, 0, 0, 0, 0, 0,  
-        #    -70, 0, 0, 0, 0, 0, 0, 
-        #])
+
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
