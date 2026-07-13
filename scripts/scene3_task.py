@@ -2,6 +2,7 @@
 
 import rospy
 import numpy
+import math
 
 try:
     import cv2
@@ -101,6 +102,57 @@ def getHandOrigin(headBasis, tfReader, timeout=1.0):
     leftCenter = getSingleCenter(LEFT_WRIST_CAMERA_FRAME)
     rightCenter = getSingleCenter(RIGHT_WRIST_CAMERA_FRAME)
     return leftCenter, rightCenter
+
+def visualWorld2base(point_world_mm, basis, tf_reader, timeout=1.0):
+    """
+    将视觉世界系下的点变换到 base_link 系。
+
+    视觉世界系（Scene 3 感知管线中的 `worldPos` 坐标系）：
+      - 原点：头部相机光心
+      - 轴：列向量 [groundTangent, groundBitangent, groundNormal] = basis
+      - 单位：毫米 (mm)
+
+    base_link 系：
+      - 原点：机器人双脚中心地面
+      - 轴：ROS 标准（X=前, Y=左, Z=上）
+      - 单位：米 (m)
+
+    变换链：
+      P_world (mm, 视觉世界系) ─── [basis^T] ───→ P_head_cam (mm, 头部光学系)
+                                                       ─── [TF: head→base, /1000] ───→ P_base (m, base_link)
+
+    参数:
+        point_world_mm : shape (3,) numpy 数组，视觉世界系坐标 (mm)
+        basis         : shape (3, 3) numpy 数组，basis 矩阵（列向量 = 视觉世界系轴）
+        tf_reader     : TFReader 实例，用于查询头部相机到 base_link 的 TF
+        timeout       : TF 查询超时，单位秒
+
+    返回:
+        shape (3,) numpy 数组，base_link 系坐标 (米)；TF 查询失败返回 None
+    """
+    point_world_mm = numpy.asarray(point_world_mm, dtype=numpy.float32)
+    if point_world_mm.shape != (3,):
+        raise ValueError(f"point_world_mm 需要 shape (3,), 收到 {point_world_mm.shape}")
+
+    # 1. 视觉世界系 → 头部相机光学系
+    # worldPos = pos @ basis  →  pos = worldPos @ basis^T
+    # 单个点: P_head_cam = basis @ P_world (列向量) = P_world @ basis^T (行向量)
+    point_head_cam_mm = point_world_mm @ basis.T  # shape (3,) in mm
+
+    # 2. TF 查询: 头部相机在 base_link 系下的位姿
+    head_pos, head_quat = tf_reader.lookup("base_link", HEAD_CAMERA_FRAME, timeout=timeout)
+    if head_pos is None or head_quat is None:
+        return None
+
+    # 3. 旋转: 头部光学系 → base_link
+    R_head_to_base = quatToRotMatrix(head_quat)  # (3, 3)
+
+    # 4. 变换: P_base = R @ P_head + t，单位 mm → m
+    point_head_cam_m = point_head_cam_mm / 1000.0
+    point_base = R_head_to_base @ point_head_cam_m + numpy.asarray(head_pos, dtype=numpy.float32)
+
+    return point_base
+
 
 def rasterizeSegment(canvas, point0, point1, basis, fx, fy, cx, cy, color=(0, 255, 0), thickness=2, near=1e-4):
     height, width = canvas.shape[:2]
@@ -418,7 +470,7 @@ def run_scene3(robot, arm, claw, head, log):
     log("场景三：SMT 料盘出库 — 任务开始")
     log("=" * 50)
 
-    rospy.sleep(10.0)
+    rospy.sleep(15.0)
 
     headCamInfo = rospy.wait_for_message("/cam_h/color/camera_info", CameraInfo)
     rightCamInfo = rospy.wait_for_message("/cam_r/color/camera_info", CameraInfo)
@@ -441,7 +493,7 @@ def run_scene3(robot, arm, claw, head, log):
     leftCX = leftCamInfo.K[2]
     leftCY = leftCamInfo.K[5]
 
-    rate = rospy.Rate(15.0)
+    rate = rospy.Rate(10.0)
 
     groundTangent = numpy.zeros((3,))
 
@@ -452,17 +504,14 @@ def run_scene3(robot, arm, claw, head, log):
     kernel77 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7), anchor=None)
 
     layerRemainCount = [2, 3]
+    phase = "turn"
+    phase_time = None
+    initial_tangent = None
 
     while not rospy.is_shutdown():
         objectBoundingBoxCorners = []
 
         depth = cam.get_head_depth()
-        # farMask = ((depth <= 10000) & ~numpy.isnan(depth)).astype(numpy.uint8)
-        depth[depth > 10000] = 0
-        validMask = (depth != 0).astype(numpy.uint8)
-        validMask = cv2.erode(validMask, kernel77, iterations=1)
-        # cv2.imshow("validMask", validMask * 255)
-
         bgr = cam.get_head_rgb()
         Rbgr = cam.get_right_wrist_rgb()
         Lbgr = cam.get_left_wrist_rgb()
@@ -474,6 +523,11 @@ def run_scene3(robot, arm, claw, head, log):
             log("[INFO] depth is None")
             rate.sleep()
             continue
+        # farMask = ((depth <= 10000) & ~numpy.isnan(depth)).astype(numpy.uint8)
+        depth[depth > 10000] = 0
+        validMask = (depth != 0).astype(numpy.uint8)
+        validMask = cv2.erode(validMask, kernel77, iterations=1)
+        # cv2.imshow("validMask", validMask * 255)
         pos = depthToPos(depth, headFX, headFY, headCX, headCY)
         normal = posToNormal(pos, depth)
 
@@ -641,8 +695,10 @@ def run_scene3(robot, arm, claw, head, log):
 
         for i in range(len(objectBoundingBoxCorners)):
             markAABB(bgr, basis, headFX, headFY, headCX, headCY, objectBoundingBoxCorners[i][0], objectBoundingBoxCorners[i][1])
-            markAABB(Rbgr, rightBasis, rightFX, rightFY, rightCX, rightCY, objectBoundingBoxCorners[i][0] - rightOrigin, objectBoundingBoxCorners[i][1] - rightOrigin)
-            markAABB(Lbgr, leftBasis, leftFX, leftFY, leftCX, leftCY, objectBoundingBoxCorners[i][0] - leftOrigin, objectBoundingBoxCorners[i][1] - leftOrigin)
+            if Rbgr is not None and rightBasis is not None and rightOrigin is not None:
+                markAABB(Rbgr, rightBasis, rightFX, rightFY, rightCX, rightCY, objectBoundingBoxCorners[i][0] - rightOrigin, objectBoundingBoxCorners[i][1] - rightOrigin)
+            if Lbgr is not None and leftBasis is not None and leftOrigin is not None:
+                markAABB(Lbgr, leftBasis, leftFX, leftFY, leftCX, leftCY, objectBoundingBoxCorners[i][0] - leftOrigin, objectBoundingBoxCorners[i][1] - leftOrigin)
 
         if boxClass != 0:
             markTickedLine(bgr, [0, 0, -100], [(boxBPos + boxFPos) / 2, (boxRPos + boxLPos) / 2, -100], basis, headFX, headFY, headCX, headCY, 100, 10, False, True, 10, 40, 50, [255, 255, 255], [255, 0, 0], [0, 0, 255], [0, 255, 0], 1, 1, 1, 1)
@@ -655,42 +711,61 @@ def run_scene3(robot, arm, claw, head, log):
         # cv2.imshow("gNormalImg", numpy.dot(normal, groundNormal))
         # cv2.imshow("gTangentImg", numpy.dot(normal, groundTangent))
         # cv2.imshow("gBitangentImg", numpy.dot(normal, groundBitangent))
+        cv2.namedWindow("bgr", cv2.WINDOW_GUI_EXPANDED)
         cv2.imshow("bgr", bgr / 255.0)
 
-        RcamFrontPoint = [0, 0, 1] @ rightBasis
-        rasterizeSegment(Rbgr, RcamFrontPoint, RcamFrontPoint + [0, 0.1, 0], rightBasis, rightFX, rightFY, rightCX, rightCY, [0, 0, 255], 2)
-        rasterizeSegment(Rbgr, RcamFrontPoint, RcamFrontPoint + [0.1, 0, 0], rightBasis, rightFX, rightFY, rightCX, rightCY, [255, 0, 0], 2)
-        rasterizeSegment(Rbgr, RcamFrontPoint, RcamFrontPoint + [0, 0, 0.1], rightBasis, rightFX, rightFY, rightCX, rightCY, [0, 255, 0], 2)
+        wrist_cam_ok = (Rbgr is not None and rightBasis is not None
+                        and Lbgr is not None and leftBasis is not None
+                        and rightOrigin is not None and leftOrigin is not None)
+        if wrist_cam_ok:
+            RcamFrontPoint = [0, 0, 1] @ rightBasis
+            rasterizeSegment(Rbgr, RcamFrontPoint, RcamFrontPoint + [0, 0.1, 0], rightBasis, rightFX, rightFY, rightCX, rightCY, [0, 0, 255], 2)
+            rasterizeSegment(Rbgr, RcamFrontPoint, RcamFrontPoint + [0.1, 0, 0], rightBasis, rightFX, rightFY, rightCX, rightCY, [255, 0, 0], 2)
+            rasterizeSegment(Rbgr, RcamFrontPoint, RcamFrontPoint + [0, 0, 0.1], rightBasis, rightFX, rightFY, rightCX, rightCY, [0, 255, 0], 2)
 
-        LcamFrontPoint = [0, 0, 1] @ leftBasis
-        rasterizeSegment(Lbgr, LcamFrontPoint, LcamFrontPoint + [0, 0.1, 0], leftBasis, leftFX, leftFY, leftCX, leftCY, [0, 0, 255], 2)
-        rasterizeSegment(Lbgr, LcamFrontPoint, LcamFrontPoint + [0.1, 0, 0], leftBasis, leftFX, leftFY, leftCX, leftCY, [255, 0, 0], 2)
-        rasterizeSegment(Lbgr, LcamFrontPoint, LcamFrontPoint + [0, 0, 0.1], leftBasis, leftFX, leftFY, leftCX, leftCY, [0, 255, 0], 2)
+            LcamFrontPoint = [0, 0, 1] @ leftBasis
+            rasterizeSegment(Lbgr, LcamFrontPoint, LcamFrontPoint + [0, 0.1, 0], leftBasis, leftFX, leftFY, leftCX, leftCY, [0, 0, 255], 2)
+            rasterizeSegment(Lbgr, LcamFrontPoint, LcamFrontPoint + [0.1, 0, 0], leftBasis, leftFX, leftFY, leftCX, leftCY, [255, 0, 0], 2)
+            rasterizeSegment(Lbgr, LcamFrontPoint, LcamFrontPoint + [0, 0, 0.1], leftBasis, leftFX, leftFY, leftCX, leftCY, [0, 255, 0], 2)
 
-        cv2.imshow("leftWristImg", Lbgr / 255.0)
-        cv2.imshow("rightWristImg", Rbgr / 255.0)
+            cv2.namedWindow("leftWristImg", cv2.WINDOW_GUI_EXPANDED)
+            cv2.imshow("leftWristImg", Lbgr / 255.0)
+            cv2.namedWindow("rightWristImg", cv2.WINDOW_GUI_EXPANDED)
+            cv2.imshow("rightWristImg", Rbgr / 255.0)
 
-        arm.switch_to_external_control()
 
-        #time = sensor.get_sim_time() - startTime
-        #if numpy.sin(time) > 0:
-        arm.go_to_joints([
-            -70, 0, 0, 0, 0, 0, 0,  
-            -70, 0, 0, 0, 0, 0, 0, 
-        ])
-        #else:
-        #    arm.go_to_joints([
-        #        -70, 0, 0, 0, 0, 0, 0,  
-        #        -20, 0, 0, 0, 0, 0, 0, 
-        #    ])
+        if phase == "turn":
+            if phase_time is None:
+                phase_time = sensor.get_sim_time()
+                initial_tangent = groundTangent.copy()          # ← 保存第一帧的初始方向
 
-        # if time < 3:
-        #     robot.move_forward(speed=0.4)
-        # elif time < 6:
-        #     robot.squat(-0.4)
-        # else:
-        #robot.turn_left(angular_speed=0.2)
+            robot.turn_left(0.5) # 不能转太快
 
+            cos_angle = numpy.dot(initial_tangent, groundTangent)
+            # cos(π) ≈ -1, 给一点容差，< -0.95 就认为转了约 180°
+            if cos_angle < -0.95 or sensor.get_sim_time() - phase_time > 15.0:
+                robot.stop()
+                log(f"[INFO] 转身完成: dot={cos_angle:.3f}, 耗时 {sensor.get_sim_time() - phase_time:.1f}s")
+                phase = "walk_to_table"
+                phase_time = None
+        
+        if phase == "walk_to_table":
+            if boxClass == 2: # 桌子
+                if boxFPos > 600:
+                    robot.move_forward(0.5)
+                    print(boxFPos)
+                else:
+                    robot.stop()
+            else:
+                log(f"[ERROR] {phase}: table not found!")
+                robot.stop()
+
+        #arm.switch_to_external_control()
+
+        #arm.go_to_joints([
+        #    -70, 0, 0, 0, 0, 0, 0,  
+        #    -70, 0, 0, 0, 0, 0, 0, 
+        #])
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
