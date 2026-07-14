@@ -74,8 +74,11 @@ def getHandBasis(headBasis, tfReader, timeout=1.0):
         rotation_optical = quatToRotMatrix(quat)
         return rotation_optical @ headBasis
 
-    leftBasis = numpy.diag([1.0, -1.0, -1.0]) @ transformSingle(LEFT_WRIST_CAMERA_FRAME)
-    rightBasis = numpy.diag([1.0, -1.0, -1.0]) @ transformSingle(RIGHT_WRIST_CAMERA_FRAME)
+    leftHeadBasis = transformSingle(LEFT_WRIST_CAMERA_FRAME)
+    rightHeadBasis = transformSingle(RIGHT_WRIST_CAMERA_FRAME)
+    opticalFix = numpy.diag([1.0, -1.0, -1.0])
+    leftBasis = None if leftHeadBasis is None else opticalFix @ leftHeadBasis
+    rightBasis = None if rightHeadBasis is None else opticalFix @ rightHeadBasis
     return leftBasis, rightBasis
 
 def getHandOrigin(headBasis, tfReader, timeout=1.0):
@@ -126,6 +129,7 @@ def planTrayApproach(tray_infos, basis, tf_reader, timeout=1.0):
             "trays": [
                 {"layer": 0|1, "hand": "left"|"right",
                  "center_world_mm": (3,) numpy, 视觉世界系中心,
+                 "aabb_world_mm": (min, max), 料盘在同一世界系下的 AABB,
             ]  共 2 个，分别对应左右手
     """
     if not tray_infos:
@@ -142,6 +146,8 @@ def planTrayApproach(tray_infos, basis, tf_reader, timeout=1.0):
         trays_by_layer[t["layer"]].append({
             "layer": t["layer"],
             "center_world_mm": center_world,
+            # 保留原始检测 AABB，供后续腕相机空间门限使用。
+            "aabb_world_mm": t.get("aabb_world_mm"),
         })
 
     # 每层至少有一个料盘才可能配对
@@ -378,6 +384,15 @@ def getAABBMask(minPoint, maxPoint, posImg):
            (y >= minPoint[1]) & (y <= maxPoint[1]) & \
            (z >= minPoint[2]) & (z <= maxPoint[2])
 
+def expandAABBLeftRight(minPoint, maxPoint, yScale=5.0):
+    """仅沿视觉世界系 Y（左右）轴，以中心为基准放大 AABB（单位 mm）。"""
+    minPoint = numpy.asarray(minPoint, dtype=numpy.float32)
+    maxPoint = numpy.asarray(maxPoint, dtype=numpy.float32)
+    center = (minPoint + maxPoint) / 2.0
+    halfExtent = (maxPoint - minPoint) / 2.0
+    halfExtent[1] *= yScale
+    return center - halfExtent, center + halfExtent
+
 def markAABB(buffer, basis, fx, fy, cx, cy, minPoint, maxPoint, lineWeight = 1, color = (255, 255, 255), xColor = (0, 0, 255), yColor = (0, 255, 0), zColor = (255, 0, 0)):
     if maxPoint[0] != minPoint[0]:
         rasterizeSegment(buffer, [minPoint[0], maxPoint[1], maxPoint[2]], [maxPoint[0], maxPoint[1], maxPoint[2]], basis, fx, fy, cx, cy, color, lineWeight)
@@ -534,7 +549,11 @@ def run_scene3(robot, arm, claw, head, log):
     layerRemainCount = [2, 3]
     phase = "walk_to_shelf"
     initial_tangent = None
+    # 料盘 AABB 与 basis 必须成对缓存。抬臂后头相机被 selfRadius 遮挡，
+    # 腕相机的目标框仍应基于这份最后有效的检测快照来投影。
     approach_plan = None
+    approach_basis = None
+    approach_plan_locked = False
 
     while not rospy.is_shutdown():
         objectBoundingBoxCorners = []
@@ -644,7 +663,7 @@ def run_scene3(robot, arm, claw, head, log):
         bgr[downFurthest] = (bgr[downFurthest] * numpy.array([2, 1, 2]))  
         ROI[downFurthest] = 0
 
-        selfRadius = 150
+        selfRadius = 160
         selfRadiusSquare = selfRadius * selfRadius
         ROI[numpy.square(worldPos[:, :, 0]) + numpy.square(worldPos[:, :, 1]) < selfRadiusSquare] = 0
 
@@ -708,6 +727,11 @@ def run_scene3(robot, arm, claw, head, log):
                         "x_center_world_mm": float((FBoundary + BBoundary) / 2.0),
                         "z_center_world_mm": float(UBoundary + (FBoundary - BBoundary) / 2.0),
                         "z_top_world_mm": float(UBoundary),
+                        # 与 center_world_mm 同处当前 basis 定义的视觉世界系。
+                        "aabb_world_mm": (
+                            numpy.array([FBoundary, LBoundary, UBoundary + FBoundary - BBoundary], dtype=numpy.float32),
+                            numpy.array([BBoundary, RBoundary, UBoundary], dtype=numpy.float32),
+                        ),
                     })
         elif boxClass == 2:
             cullDistThreshold = 50
@@ -726,12 +750,23 @@ def run_scene3(robot, arm, claw, head, log):
             # markAABB(bgr, basis, headFX, headFY, headCX, headCY, [FBoundary + targetThickNess, LBoundary + targetThickNess, UBoundary + goodHeight[0]], [BBoundary - targetThickNess, RBoundary - targetThickNess, UBoundary + goodHeight[1]])
             objectBoundingBoxCorners.append([[FBoundary + targetThickNess, LBoundary + targetThickNess, UBoundary + goodHeight[0]], [BBoundary - targetThickNess, RBoundary - targetThickNess, UBoundary + goodHeight[1]]])
 
-        # ---- 最优站位规划（保持上次有效结果）----
-        if boxClass == 1:
-            approach_plan = planTrayApproach(tray_infos, basis, tf)
+        # ---- 最优站位规划（保持最后一次有效检测快照）----
+        # 抬臂后头部画面会被 selfRadius 内的机械臂遮挡；此时绝不能用
+        # 当前帧的错误 box/basis 覆盖供腕相机使用的目标坐标。
+        if boxClass == 1 and not approach_plan_locked:
+            candidate_plan = planTrayApproach(tray_infos, basis, tf)
+            if candidate_plan is not None:
+                approach_plan = candidate_plan
+                approach_basis = basis.copy()
 
         leftBasis, rightBasis = getHandBasis(basis, tf)
         leftOrigin, rightOrigin = getHandOrigin(basis, tf)
+        if approach_basis is not None:
+            planLeftBasis, planRightBasis = getHandBasis(approach_basis, tf)
+            planLeftOrigin, planRightOrigin = getHandOrigin(approach_basis, tf)
+        else:
+            planLeftBasis = planRightBasis = None
+            planLeftOrigin = planRightOrigin = None
 
         for i in range(len(objectBoundingBoxCorners)):
             markAABB(bgr, basis, headFX, headFY, headCX, headCY, objectBoundingBoxCorners[i][0], objectBoundingBoxCorners[i][1])
@@ -751,11 +786,11 @@ def run_scene3(robot, arm, claw, head, log):
         # cv2.imshow("gNormalImg", numpy.dot(normal, groundNormal))
         # cv2.imshow("gTangentImg", numpy.dot(normal, groundTangent))
         # cv2.imshow("gBitangentImg", numpy.dot(normal, groundBitangent))
-        # ---- 头相机红点：标记左右手各自料盘中心 ----
-        if approach_plan is not None:
+        # ---- 头相机红点：标记缓存检测快照中的料盘中心 ----
+        if approach_plan is not None and approach_basis is not None:
             for tray in approach_plan["trays"]:
                 center = numpy.asarray(tray["center_world_mm"], dtype=numpy.float32)
-                p = basis @ center
+                p = approach_basis @ center
                 if p[2] > 0:
                     u = int(round(headFX * p[0] / p[2] + headCX))
                     v = int(round(headFY * p[1] / p[2] + headCY))
@@ -778,22 +813,40 @@ def run_scene3(robot, arm, claw, head, log):
             rasterizeSegment(Lbgr, LcamFrontPoint, LcamFrontPoint + [0.1, 0, 0], leftBasis, leftFX, leftFY, leftCX, leftCY, [255, 0, 0], 2)
             rasterizeSegment(Lbgr, LcamFrontPoint, LcamFrontPoint + [0, 0, 0.1], leftBasis, leftFX, leftFY, leftCX, leftCY, [0, 255, 0], 2)
 
-            # ---- 手腕相机红点：标记分配给该手的料盘中心 ----
-            if approach_plan is not None:
+            # ---- 手腕相机：红点 + 左右(Y轴)扩大 2x 的缓存料盘 AABB ----
+            # 所有投影都使用 approach_basis，不使用被抬起手臂干扰的当前 basis。
+            if (approach_plan is not None and planLeftBasis is not None and
+                    planRightBasis is not None and planLeftOrigin is not None and
+                    planRightOrigin is not None):
                 for tray in approach_plan["trays"]:
                     center = numpy.asarray(tray["center_world_mm"], dtype=numpy.float32)
+                    aabb = tray.get("aabb_world_mm")
+                    if aabb is not None:
+                        aabbMin, aabbMax = aabb
+                        expandedMin, expandedMax = expandAABBLeftRight(aabbMin, aabbMax)
+
                     if tray["hand"] == "left":
-                        p = leftBasis @ (center - leftOrigin)
+                        p = planLeftBasis @ (center - planLeftOrigin)
                         if p[2] > 0:
                             u = int(round(leftFX * p[0] / p[2] + leftCX))
                             v = int(round(leftFY * p[1] / p[2] + leftCY))
                             cv2.circle(Lbgr, (u, v), 10, (0, 0, 255), -1)
+                        if aabb is not None:
+                            markAABB(Lbgr, planLeftBasis, leftFX, leftFY, leftCX, leftCY,
+                                     expandedMin - planLeftOrigin, expandedMax - planLeftOrigin,
+                                     lineWeight=3, color=(0, 255, 255),
+                                     xColor=(0, 200, 255), yColor=(0, 255, 200), zColor=(0, 165, 255))
                     else:
-                        p = rightBasis @ (center - rightOrigin)
+                        p = planRightBasis @ (center - planRightOrigin)
                         if p[2] > 0:
                             u = int(round(rightFX * p[0] / p[2] + rightCX))
                             v = int(round(rightFY * p[1] / p[2] + rightCY))
                             cv2.circle(Rbgr, (u, v), 10, (0, 0, 255), -1)
+                        if aabb is not None:
+                            markAABB(Rbgr, planRightBasis, rightFX, rightFY, rightCX, rightCY,
+                                     expandedMin - planRightOrigin, expandedMax - planRightOrigin,
+                                     lineWeight=3, color=(0, 255, 255),
+                                     xColor=(0, 200, 255), yColor=(0, 255, 200), zColor=(0, 165, 255))
 
             cv2.namedWindow("leftWristImg", cv2.WINDOW_GUI_EXPANDED)
             cv2.imshow("leftWristImg", Lbgr / 255.0)
@@ -855,7 +908,8 @@ def run_scene3(robot, arm, claw, head, log):
                 phase = "walk_to_shelf"
                 continue
 
-            selfRadius = 800  # 手臂抬起后遮挡视野，不再依赖当前帧感知
+            # 此后头相机被手臂遮挡：冻结最后一次有效检测的 plan/AABB/basis。
+            approach_plan_locked = True
 
             arm.switch_to_external_control()
             rospy.sleep(3.0)
@@ -878,9 +932,9 @@ def run_scene3(robot, arm, claw, head, log):
             rospy.sleep(4.0)
 
             if upper_joints == "left":
-                left_arm = [-40, 0, 0, -80, -90, -40, 0]
+                left_arm = [-20, 0, 0, -110, -90, -40, 0]
             else:
-                right_arm = [-40, 0, 0, -80, 90, 40, 0]
+                right_arm = [-20, 0, 0, -110, 90, 40, 0]
             arm.go_to_joints(left_arm + right_arm)
             rospy.sleep(4.0)
 
