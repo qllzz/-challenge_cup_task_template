@@ -53,6 +53,26 @@ def quatToRotMatrix(quat):
         [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
     ], dtype=numpy.float32)
 
+def visualWorldVectorToBase(vectorWorldMm, worldBasis, tfReader, timeout=1.0):
+    """将视觉世界系中的无原点位移向量（mm）变换为 base_link 位移（m）。"""
+    _, headQuat = tfReader.lookup("base_link", HEAD_CAMERA_FRAME, timeout=timeout)
+    if headQuat is None:
+        return None
+    try:
+        rotationHeadToBase = quatToRotMatrix(headQuat)
+    except ValueError:
+        return None
+
+    # 对行向量：world = head_camera @ basis，故逆变换乘 basis.T。
+    vectorHeadMm = numpy.asarray(vectorWorldMm, dtype=numpy.float32) @ worldBasis.T
+    return rotationHeadToBase @ (vectorHeadMm / 1000.0)
+
+def wristCameraVectorToBase(vectorCameraMm, wristBasis, worldBasis, tfReader,
+                            timeout=1.0):
+    """腕相机光学系中的位移向量（mm）→ base_link 位移（m）。"""
+    vectorWorldMm = numpy.asarray(vectorCameraMm, dtype=numpy.float32) @ wristBasis
+    return visualWorldVectorToBase(vectorWorldMm, worldBasis, tfReader, timeout)
+
 def getHandBasis(headBasis, tfReader, timeout=1.0):
     """
     将头部 optical 相机系下的 basis 方向向量转换到左右手 optical 相机系。
@@ -393,6 +413,108 @@ def expandAABBLeftRight(minPoint, maxPoint, yScale=5.0):
     halfExtent[1] *= yScale
     return center - halfExtent, center + halfExtent
 
+def detectTrayInWristAABB(depth, wristBasis, wristOrigin, fx, fy, cx, cy,
+                           expectedCenterWorld, aabbMin, aabbMax,
+                           minPixels=30):
+    """
+    以视觉世界系 AABB 作为 3D ROI，在腕部深度图中检测料盘。
+
+    返回 (detection, componentMask)。detection 为空表示 ROI 中没有足够
+    的有效料盘点；否则 offset_camera_mm 是 (X右, Y下, Z前)，单位 mm。
+    """
+    if depth is None:
+        return None, None
+
+    validDepth = numpy.isfinite(depth) & (depth > 0) & (depth < 10000)
+    if numpy.count_nonzero(validDepth) < minPixels:
+        return None, None
+
+    # 对行向量：world = camera @ basis + origin。
+    # wristBasis 的列是视觉世界轴在腕相机光学系中的表达。
+    posCamera = depthToPos(depth, fx, fy, cx, cy)
+    posWorld = posCamera @ wristBasis + wristOrigin
+    roiMask = validDepth & getAABBMask(aabbMin, aabbMax, posWorld)
+    if numpy.count_nonzero(roiMask) < minPixels:
+        return None, roiMask
+
+    # 架体会干扰投影 AABB 的下方区域；仅保留该 AABB 在腕部图像中
+    # 上方 2/3（较小 v）的点。切线由投影后的 AABB 角点决定，不受
+    # AABB 内架体深度点影响。
+    aabbMin = numpy.asarray(aabbMin, dtype=numpy.float32)
+    aabbMax = numpy.asarray(aabbMax, dtype=numpy.float32)
+    aabbCorners = numpy.array([
+        [x, y, z]
+        for x in (aabbMin[0], aabbMax[0])
+        for y in (aabbMin[1], aabbMax[1])
+        for z in (aabbMin[2], aabbMax[2])
+    ], dtype=numpy.float32)
+    aabbCamera = (aabbCorners - wristOrigin) @ wristBasis.T
+    visibleCorners = aabbCamera[aabbCamera[:, 2] > 1.0]
+    if len(visibleCorners) == 0:
+        return None, roiMask
+    aabbRows = fy * visibleCorners[:, 1] / visibleCorners[:, 2] + cy
+    topRow = float(numpy.min(aabbRows))
+    bottomRow = float(numpy.max(aabbRows))
+    upperCutRow = topRow + (bottomRow - topRow) * (1.0 / 2.0)
+    pixelRows = numpy.arange(depth.shape[0], dtype=numpy.float32)[:, None]
+    upperRoiMask = roiMask & (pixelRows <= upperCutRow)
+    if numpy.count_nonzero(upperRoiMask) < minPixels:
+        return None, upperRoiMask
+
+    # 左右放大的 ROI 可能包含相邻料盘；按上方 2/3 的 2D 连通域拆分，
+    # 再选择 3D 中心最接近头相机预测中心的目标。
+    componentCount, labels, stats, _ = cv2.connectedComponentsWithStats(
+        upperRoiMask.astype(numpy.uint8), connectivity=8)
+    expectedCenterWorld = numpy.asarray(expectedCenterWorld, dtype=numpy.float32)
+    bestLabel = -1
+    bestScore = float("inf")
+    for label in range(1, componentCount):
+        if stats[label, cv2.CC_STAT_AREA] < minPixels:
+            continue
+        componentMask = labels == label
+        componentCenterWorld = numpy.median(posWorld[componentMask], axis=0)
+        score = numpy.linalg.norm(componentCenterWorld - expectedCenterWorld)
+        if score < bestScore:
+            bestScore = score
+            bestLabel = label
+
+    if bestLabel < 0:
+        return None, upperRoiMask
+
+    componentMask = labels == bestLabel
+    componentCamera = posCamera[componentMask]
+    centerDepthMm = float(numpy.median(componentCamera[:, 2]))
+    if centerDepthMm <= 0:
+        return None, componentMask
+
+    # 上方 1/2 的点云本身不能直接取 y 中位数，否则会把"完整料盘中心"
+    # 错误地偏向上方。假设筛到的是料盘上方 1/2：上段高度为完整高度的
+    # 1/2，完整中心位于上段 top + 1.0 * upper_height = 上段底部。
+    componentRows, componentCols = numpy.nonzero(componentMask)
+    topComponentRow = float(numpy.percentile(componentRows, 2.0))
+    bottomComponentRow = float(numpy.percentile(componentRows, 98.0))
+    centerRow = topComponentRow + 1.0 * (bottomComponentRow - topComponentRow)
+    centerCol = float(numpy.median(componentCols))
+    centerCamera = numpy.array([
+        (centerCol - cx) * centerDepthMm / fx,
+        (centerRow - cy) * centerDepthMm / fy,
+        centerDepthMm,
+    ], dtype=numpy.float32)
+
+    # 料盘面可能相对相机倾斜，中心深度不是机器人近边缘的深度。
+    # 取最低 5% 深度的分位值，既贴近近边缘，又能剔除孤立错误深度点。
+    nearEdgeDepthMm = float(numpy.percentile(componentCamera[:, 2], 5.0))
+    u = centerCol
+    v = centerRow
+    return {
+        "offset_camera_mm": centerCamera,
+        "near_edge_depth_mm": nearEdgeDepthMm,
+        "pixel_offset": numpy.array([u - cx, v - cy], dtype=numpy.float32),
+        "pixel": numpy.array([u, v], dtype=numpy.float32),
+        "point_count": int(numpy.count_nonzero(componentMask)),
+        "upper_roi_cut_row": upperCutRow,
+    }, componentMask
+
 def markAABB(buffer, basis, fx, fy, cx, cy, minPoint, maxPoint, lineWeight = 1, color = (255, 255, 255), xColor = (0, 0, 255), yColor = (0, 255, 0), zColor = (255, 0, 0)):
     if maxPoint[0] != minPoint[0]:
         rasterizeSegment(buffer, [minPoint[0], maxPoint[1], maxPoint[2]], [maxPoint[0], maxPoint[1], maxPoint[2]], basis, fx, fy, cx, cy, color, lineWeight)
@@ -554,6 +676,12 @@ def run_scene3(robot, arm, claw, head, log):
     approach_plan = None
     approach_basis = None
     approach_plan_locked = False
+    active_grab_hand = None
+    WRIST_ALIGN_TOLERANCE_MM = 8.0
+    WRIST_DEPTH_TARGET_MM = 70.0
+    WRIST_DEPTH_TOLERANCE_MM = 10.0
+    WRIST_ALIGN_MAX_STEP_M = 0.04
+    LIFT_DISTANCE_M = 0.05
 
     while not rospy.is_shutdown():
         objectBoundingBoxCorners = []
@@ -562,6 +690,10 @@ def run_scene3(robot, arm, claw, head, log):
         bgr = cam.get_head_rgb()
         Rbgr = cam.get_right_wrist_rgb()
         Lbgr = cam.get_left_wrist_rgb()
+        Rdepth = cam.get_right_wrist_depth()
+        Ldepth = cam.get_left_wrist_depth()
+        # 本帧腕部深度实测的料盘偏移，key 为 "left" / "right"。
+        wrist_tray_offsets = {}
         if bgr is None:
             log("[INFO] bgr is None")
             rate.sleep()
@@ -813,17 +945,19 @@ def run_scene3(robot, arm, claw, head, log):
             rasterizeSegment(Lbgr, LcamFrontPoint, LcamFrontPoint + [0.1, 0, 0], leftBasis, leftFX, leftFY, leftCX, leftCY, [255, 0, 0], 2)
             rasterizeSegment(Lbgr, LcamFrontPoint, LcamFrontPoint + [0, 0, 0.1], leftBasis, leftFX, leftFY, leftCX, leftCY, [0, 255, 0], 2)
 
-            # ---- 手腕相机：红点 + 左右(Y轴)扩大 2x 的缓存料盘 AABB ----
-            # 所有投影都使用 approach_basis，不使用被抬起手臂干扰的当前 basis。
+            # ---- 手腕相机：缓存 AABB + 深度 ROI 料盘实测 ----
+            # 所有投影、ROI 均使用 approach_basis，不使用被抬起手臂干扰的当前 basis。
             if (approach_plan is not None and planLeftBasis is not None and
                     planRightBasis is not None and planLeftOrigin is not None and
                     planRightOrigin is not None):
                 for tray in approach_plan["trays"]:
                     center = numpy.asarray(tray["center_world_mm"], dtype=numpy.float32)
                     aabb = tray.get("aabb_world_mm")
-                    if aabb is not None:
-                        aabbMin, aabbMax = aabb
-                        expandedMin, expandedMax = expandAABBLeftRight(aabbMin, aabbMax)
+                    if aabb is None:
+                        continue
+                    aabbMin, aabbMax = aabb
+                    # 使用与黄色框完全相同的左右放大 3D ROI。
+                    expandedMin, expandedMax = expandAABBLeftRight(aabbMin, aabbMax)
 
                     if tray["hand"] == "left":
                         p = planLeftBasis @ (center - planLeftOrigin)
@@ -831,22 +965,38 @@ def run_scene3(robot, arm, claw, head, log):
                             u = int(round(leftFX * p[0] / p[2] + leftCX))
                             v = int(round(leftFY * p[1] / p[2] + leftCY))
                             cv2.circle(Lbgr, (u, v), 10, (0, 0, 255), -1)
-                        if aabb is not None:
-                            markAABB(Lbgr, planLeftBasis, leftFX, leftFY, leftCX, leftCY,
-                                     expandedMin - planLeftOrigin, expandedMax - planLeftOrigin,
-                                     lineWeight=3, color=(0, 255, 255),
-                                     xColor=(0, 200, 255), yColor=(0, 255, 200), zColor=(0, 165, 255))
+                        markAABB(Lbgr, planLeftBasis, leftFX, leftFY, leftCX, leftCY,
+                                 expandedMin - planLeftOrigin, expandedMax - planLeftOrigin,
+                                 lineWeight=3, color=(0, 255, 255),
+                                 xColor=(0, 200, 255), yColor=(0, 255, 200), zColor=(0, 165, 255))
+                        detection, componentMask = detectTrayInWristAABB(
+                            Ldepth, planLeftBasis, planLeftOrigin,
+                            leftFX, leftFY, leftCX, leftCY,
+                            center, expandedMin, expandedMax)
+                        if detection is not None:
+                            wrist_tray_offsets["left"] = detection
+                            Lbgr[componentMask] = Lbgr[componentMask] * 0.35 + numpy.array([0, 255, 0]) * 0.65
+                            observedU, observedV = numpy.rint(detection["pixel"]).astype(int)
+                            cv2.circle(Lbgr, (observedU, observedV), 7, (0, 255, 0), -1)
                     else:
                         p = planRightBasis @ (center - planRightOrigin)
                         if p[2] > 0:
                             u = int(round(rightFX * p[0] / p[2] + rightCX))
                             v = int(round(rightFY * p[1] / p[2] + rightCY))
                             cv2.circle(Rbgr, (u, v), 10, (0, 0, 255), -1)
-                        if aabb is not None:
-                            markAABB(Rbgr, planRightBasis, rightFX, rightFY, rightCX, rightCY,
-                                     expandedMin - planRightOrigin, expandedMax - planRightOrigin,
-                                     lineWeight=3, color=(0, 255, 255),
-                                     xColor=(0, 200, 255), yColor=(0, 255, 200), zColor=(0, 165, 255))
+                        markAABB(Rbgr, planRightBasis, rightFX, rightFY, rightCX, rightCY,
+                                 expandedMin - planRightOrigin, expandedMax - planRightOrigin,
+                                 lineWeight=3, color=(0, 255, 255),
+                                 xColor=(0, 200, 255), yColor=(0, 255, 200), zColor=(0, 165, 255))
+                        detection, componentMask = detectTrayInWristAABB(
+                            Rdepth, planRightBasis, planRightOrigin,
+                            rightFX, rightFY, rightCX, rightCY,
+                            center, expandedMin, expandedMax)
+                        if detection is not None:
+                            wrist_tray_offsets["right"] = detection
+                            Rbgr[componentMask] = Rbgr[componentMask] * 0.35 + numpy.array([0, 255, 0]) * 0.65
+                            observedU, observedV = numpy.rint(detection["pixel"]).astype(int)
+                            cv2.circle(Rbgr, (observedU, observedV), 7, (0, 255, 0), -1)
 
             cv2.namedWindow("leftWristImg", cv2.WINDOW_GUI_EXPANDED)
             cv2.imshow("leftWristImg", Lbgr / 255.0)
@@ -858,8 +1008,8 @@ def run_scene3(robot, arm, claw, head, log):
             if boxClass == 1:
                 print(boxBPos)
                 if abs(boxBPos) > 1000:
-                    robot.move_forward(0.3, (boxFPos/10-50)/0.3)
-                elif abs(boxBPos) > 400:
+                    robot.move_forward(0.3, (boxFPos/10-70)/0.3)
+                elif abs(boxBPos) > 600:
                     robot.move_forward(0.05)
                 else:
                     robot.stop()
@@ -890,8 +1040,17 @@ def run_scene3(robot, arm, claw, head, log):
                     robot.move_right(0.03 * abs(off) / off)
                 elif boxClass == 1:
                     robot.stop()
-                    phase = "upper_hand_ready"
+                    phase = "post_side_shift"
 
+        
+        if phase == "post_side_shift":
+            print(boxBPos)
+            if boxClass == 1:
+                if abs(boxBPos) > 300:
+                    robot.move_forward(0.05)
+                else:
+                    robot.stop()
+                    phase = "upper_hand_ready"
 
         if phase == "upper_hand_ready":
             assert(approach_plan)
@@ -908,6 +1067,7 @@ def run_scene3(robot, arm, claw, head, log):
                 phase = "walk_to_shelf"
                 continue
 
+            active_grab_hand = upper_joints
             # 此后头相机被手臂遮挡：冻结最后一次有效检测的 plan/AABB/basis。
             approach_plan_locked = True
 
@@ -918,38 +1078,102 @@ def run_scene3(robot, arm, claw, head, log):
             right_arm = [0, 0, 0, 0, 0, 0, 0]
 
             if upper_joints == "left":
-                left_arm = [30, 0, 0, -130, -90, 0, 0]
+                left_arm = [30, 0, 0, 0, 0, 0, 0]
             else:
-                right_arm = [30, 0, 0, -130, 90, 0, 0]
+                right_arm = [30, 0, 0, 0, 0, 0, 0]
             arm.go_to_joints(left_arm + right_arm)
-            rospy.sleep(1.0)
+            rospy.sleep(2.0)
 
             if upper_joints == "left":
-                left_arm = [0, 0, 0, -130, -90, 0, 0]
+                left_arm = [30, 0, 0, -150, -90, 0, 0]
             else:
-                right_arm = [0, 0, 0, -130, 90, 0, 0]
+                right_arm = [30, 0, 0, -150, 90, 0, 0]
             arm.go_to_joints(left_arm + right_arm)
-            rospy.sleep(4.0)
+            rospy.sleep(2.0)
+
+            if upper_joints == "left":
+                left_arm = [-10, 0, 0, -150, -90, 0, 0]
+            else:
+                right_arm = [-10, 0, 0, -150, 90, 0, 0]
+            arm.go_to_joints(left_arm + right_arm)
+            rospy.sleep(3.0)
 
             if upper_joints == "left":
                 left_arm = [-20, 0, 0, -110, -90, -40, 0]
             else:
                 right_arm = [-20, 0, 0, -110, 90, 40, 0]
             arm.go_to_joints(left_arm + right_arm)
-            rospy.sleep(4.0)
+            rospy.sleep(5.0)
 
             log(f"[INFO] upper_hand_ready: {upper_joints} arm raised for upper layer")
             phase = "grab_upper_smt"
         
         if phase == "grab_upper_smt":
-            for tray in approach_plan["trays"]:
-                center = numpy.asarray(tray["center_world_mm"], dtype=numpy.float32)
-                if tray["hand"] == "left":
-                    p = leftBasis @ (center - leftOrigin)
-                    log(f"左手腕→料盘: X={p[0]:.0f}mm(右), Y={p[1]:.0f}mm(下), Z={p[2]:.0f}mm(前)")
-            #claw.left_close()
+            # 只校正当前抬起、准备抓取上层料盘的手，避免带动另一只手。
+            detection = wrist_tray_offsets.get(active_grab_hand)
+            if detection is None:
+                log(f"[INFO] {active_grab_hand} wrist: AABB ROI 内未检测到料盘")
+            else:
+                offset = detection["offset_camera_mm"]
+                pixelOffset = detection["pixel_offset"]
+                lateralOffsetMm = float(offset[0])  # 腕相机光学帧 X：向右为正
+                nearEdgeDepthMm = float(detection["near_edge_depth_mm"])
+                forwardErrorMm = nearEdgeDepthMm - WRIST_DEPTH_TARGET_MM
+                log(f"{active_grab_hand} 手腕实测→料盘: X={offset[0]:.0f}mm(右), "
+                    f"Y={offset[1]:.0f}mm(下), Z中心={offset[2]:.0f}mm(前), "
+                    f"Z近边缘={nearEdgeDepthMm:.0f}mm, "
+                    f"像素偏移=({pixelOffset[0]:.1f}, {pixelOffset[1]:.1f}), "
+                    f"点数={detection['point_count']}")
 
+                if approach_basis is None:
+                    log("[ERROR] wrist alignment: 缺少冻结的视觉 world basis")
+                else:
+                    handBasis = planLeftBasis if active_grab_hand == "left" else planRightBasis
 
+                    if abs(lateralOffsetMm) > WRIST_ALIGN_TOLERANCE_MM:
+                        deltaBaseM = wristCameraVectorToBase(
+                            [lateralOffsetMm, 0.0, 0.0], handBasis, approach_basis, tf)
+                        deltaNorm = float(numpy.linalg.norm(deltaBaseM))
+                        if deltaNorm > WRIST_ALIGN_MAX_STEP_M:
+                            deltaBaseM *= WRIST_ALIGN_MAX_STEP_M / deltaNorm
+                        log(f"[INFO] {active_grab_hand} wrist: 横向校正 "
+                            f"{lateralOffsetMm:.1f}mm -> base Δ={deltaBaseM.tolist()} m")
+                        arm.move_relative(active_grab_hand, deltaBaseM.tolist(),
+                                         max_error_m=0.03, sleep=1.5)
+
+                    if abs(forwardErrorMm) > WRIST_DEPTH_TOLERANCE_MM:
+                        deltaBaseM = wristCameraVectorToBase(
+                            [0.0, 0.0, forwardErrorMm], handBasis, approach_basis, tf)
+                        deltaNorm = float(numpy.linalg.norm(deltaBaseM))
+                        if deltaNorm > WRIST_ALIGN_MAX_STEP_M:
+                            deltaBaseM *= WRIST_ALIGN_MAX_STEP_M / deltaNorm
+                        log(f"[INFO] {active_grab_hand} wrist: 前后校正 "
+                            f"近边缘 {nearEdgeDepthMm:.1f}mm -> "
+                            f"目标 {WRIST_DEPTH_TARGET_MM:.1f}mm, base Δ={deltaBaseM.tolist()} m")
+                        arm.move_relative(active_grab_hand, deltaBaseM.tolist(),
+                                         max_error_m=0.03, sleep=1.5)
+
+                    log(f"[INFO] {active_grab_hand} wrist: 校正完成，开始夹取")
+                    rospy.sleep(3.0)
+                    phase = "close_upper_smt"
+        if phase == "close_upper_smt":
+            (claw.left_close() if active_grab_hand == "left" else claw.right_close())
+            claw.wait_until_done(timeout=3.0)
+            rospy.sleep(3.0)
+            log(f"[INFO] {active_grab_hand} claw: 已闭合，开始上提")
+            phase = "lift_upper_smt"
+
+        if phase == "lift_upper_smt":
+            left_arm  = [0, 0, 0, 0, 0, 0, 0]
+            right_arm = [0, 0, 0, 0, 0, 0, 0]
+            if active_grab_hand == "left":
+                left_arm = [0, 0, 0, -150, -90, 0, 0]
+            else:
+                right_arm = [0, 0, 0, -150, 90, 0, 0]
+            arm.go_to_joints(left_arm + right_arm)
+            rospy.sleep(2.0)
+            log(f"[INFO] {active_grab_hand} arm: 已上提")
+            phase = "upper_smt_lifted"
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
