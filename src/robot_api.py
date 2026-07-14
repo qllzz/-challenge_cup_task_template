@@ -74,7 +74,7 @@ class RobotMover:
 
     def move_right(self, speed, duration=None):
         """右移。"""
-        self._publish(0.0, -abs(speed), 0.0, 0.0, duration)
+        self._publish(0.0, -speed, 0.0, 0.0, duration)
 
     def turn_left(self, angular_speed, duration=None):
         """左转。angular_speed 单位 rad/s（约 0.5 ≈ 慢转，1.0 ≈ 快转）。"""
@@ -380,6 +380,67 @@ class ArmController:
         except rospy.ServiceException as e:
             rospy.logerr("IK 服务调用失败: %s", e)
             return False, []
+
+    def move_relative(self, hand, delta_xyz, max_error_m=0.05, sleep=1.5):
+        """
+        在当前末端位姿基础上叠加一个相对位移，保持姿态不变。
+
+        坐标系: base_link (frame=2), 原点 = 机器人基座中心
+
+            X+ : 机器人正前方  (前进方向)
+            Y+ : 机器人左侧    (左手方向)
+            Z+ : 机器人上方    (竖直向上)
+
+        参数:
+            hand        — "left" 或 "right"
+            delta_xyz   — 相对位移 [dx, dy, dz]，单位 米，base_link 坐标系
+            max_error_m — IK 残差上限 (m)，超过则拒绝执行
+            sleep       — 到位后等待秒数
+
+        返回:
+            True / False
+
+        示例:
+            arm.move_relative("right", [ 0.05, 0.0,  0.0])  # 右手前伸 5cm
+            arm.move_relative("right", [-0.03, 0.0,  0.0])  # 右手后收 3cm
+            arm.move_relative("left",  [ 0.0,  0.05, 0.0])  # 左手左移 5cm
+            arm.move_relative("right", [ 0.0,  0.0,  0.02]) # 右手上抬 2cm
+        """
+        if hand not in ("left", "right"):
+            rospy.logerr("move_relative: hand 必须为 left 或 right")
+            return False
+
+        # 1. FK 获取当前末端位姿
+        lp, lq, rp, rq = self.fk()
+        if lp is None:
+            rospy.logerr("move_relative: FK 失败")
+            return False
+
+        if hand == "left":
+            current_pos = lp
+            current_quat = lq
+        else:
+            current_pos = rp
+            current_quat = rq
+
+        # 2. 叠加位移
+        target_pos = [
+            current_pos[i] + delta_xyz[i]
+            for i in range(3)
+        ]
+
+        # 3. IK 求解并执行
+        ok, q_arm = self.solve_ik_single_arm(
+            hand, target_pos, current_quat,
+            frame=2, max_error_m=max_error_m)
+        if not ok:
+            rospy.logerr("move_relative: IK 求解失败")
+            return False
+
+        self.apply_ik_single_arm_solution(hand, q_arm)
+        if sleep > 0:
+            rospy.sleep(sleep)
+        return True
 
     def fk(self, joints_deg=None):
         """
