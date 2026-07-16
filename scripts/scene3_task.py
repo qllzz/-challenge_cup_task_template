@@ -404,7 +404,7 @@ def getAABBMask(minPoint, maxPoint, posImg):
            (y >= minPoint[1]) & (y <= maxPoint[1]) & \
            (z >= minPoint[2]) & (z <= maxPoint[2])
 
-def expandAABBLeftRight(minPoint, maxPoint, yScale=5.0):
+def expandAABBLeftRight(minPoint, maxPoint, yScale=8.0):
     """仅沿视觉世界系 Y（左右）轴，以中心为基准放大 AABB（单位 mm）。"""
     minPoint = numpy.asarray(minPoint, dtype=numpy.float32)
     maxPoint = numpy.asarray(maxPoint, dtype=numpy.float32)
@@ -412,6 +412,51 @@ def expandAABBLeftRight(minPoint, maxPoint, yScale=5.0):
     halfExtent = (maxPoint - minPoint) / 2.0
     halfExtent[1] *= yScale
     return center - halfExtent, center + halfExtent
+
+class WristDetectionFilter(object):
+    """对腕相机单帧检测结果做滑动窗口中位数滤波。"""
+
+    def __init__(self, window=5):
+        self._window = max(1, int(window))
+        self._buf = {"left": [], "right": []}
+
+    def update(self, hand, detection):
+        """喂入一帧检测结果（可为 None，表示本帧未检测到）。"""
+        buf = self._buf[hand]
+        buf.append(detection)
+        if len(buf) > self._window:
+            buf.pop(0)
+
+    def get(self, hand):
+        """返回窗口内中位数滤波后的检测结果，全为 None 时返回 None。"""
+        buf = self._buf[hand]
+        valid = [d for d in buf if d is not None]
+        if not valid:
+            return None
+        # 单帧直接返回（窗口=1 或只有一帧有效）
+        if len(valid) == 1:
+            return valid[0]
+
+        offsets = numpy.stack([d["offset_camera_mm"] for d in valid], axis=0)
+        near_edges = numpy.array([d["near_edge_depth_mm"] for d in valid],
+                                 dtype=numpy.float32)
+        point_counts = [d["point_count"] for d in valid]
+
+        median_offset = numpy.median(offsets, axis=0)
+        median_near = float(numpy.median(near_edges))
+        # 点数取中位数，便于判断检测质量
+        median_count = int(numpy.median(point_counts))
+
+        latest = valid[-1]
+        return {
+            "offset_camera_mm": median_offset,
+            "near_edge_depth_mm": median_near,
+            "pixel_offset": latest["pixel_offset"],
+            "pixel": latest["pixel"],
+            "point_count": median_count,
+            "upper_roi_cut_row": latest.get("upper_roi_cut_row", 0),
+        }
+
 
 def detectTrayInWristAABB(depth, wristBasis, wristOrigin, fx, fy, cx, cy,
                            expectedCenterWorld, aabbMin, aabbMax,
@@ -455,7 +500,10 @@ def detectTrayInWristAABB(depth, wristBasis, wristOrigin, fx, fy, cx, cy,
     aabbRows = fy * visibleCorners[:, 1] / visibleCorners[:, 2] + cy
     topRow = float(numpy.min(aabbRows))
     bottomRow = float(numpy.max(aabbRows))
-    upperCutRow = topRow + (bottomRow - topRow) * (1.0 / 2.0)
+    # AABB 投影上半 1/2 —— 滤掉架子（架子通常在料盘下方遮挡）。
+    upperCutRow = topRow + (bottomRow - topRow) * 0.5
+    # 再与相机画幅上半 1/2 取交集，进一步排除画面下方架子。
+    upperCutRow = min(upperCutRow, float(depth.shape[0]) * 0.6)
     pixelRows = numpy.arange(depth.shape[0], dtype=numpy.float32)[:, None]
     upperRoiMask = roiMask & (pixelRows <= upperCutRow)
     if numpy.count_nonzero(upperRoiMask) < minPixels:
@@ -678,10 +726,11 @@ def run_scene3(robot, arm, claw, head, log):
     approach_plan_locked = False
     active_grab_hand = None
     WRIST_ALIGN_TOLERANCE_MM = 8.0
-    WRIST_DEPTH_TARGET_MM = 70.0
+    WRIST_DEPTH_TARGET_MM = 60.0
     WRIST_DEPTH_TOLERANCE_MM = 10.0
-    WRIST_ALIGN_MAX_STEP_M = 0.04
+    WRIST_ALIGN_MAX_STEP_M = 0.06
     LIFT_DISTANCE_M = 0.05
+    wrist_filter = WristDetectionFilter(window=5)
 
     while not rospy.is_shutdown():
         objectBoundingBoxCorners = []
@@ -795,7 +844,7 @@ def run_scene3(robot, arm, claw, head, log):
         bgr[downFurthest] = (bgr[downFurthest] * numpy.array([2, 1, 2]))  
         ROI[downFurthest] = 0
 
-        selfRadius = 160
+        selfRadius = 175
         selfRadiusSquare = selfRadius * selfRadius
         ROI[numpy.square(worldPos[:, :, 0]) + numpy.square(worldPos[:, :, 1]) < selfRadiusSquare] = 0
 
@@ -998,6 +1047,10 @@ def run_scene3(robot, arm, claw, head, log):
                             observedU, observedV = numpy.rint(detection["pixel"]).astype(int)
                             cv2.circle(Rbgr, (observedU, observedV), 7, (0, 255, 0), -1)
 
+            # 将本帧检测结果喂入帧间滤波器
+            wrist_filter.update("left", wrist_tray_offsets.get("left"))
+            wrist_filter.update("right", wrist_tray_offsets.get("right"))
+
             cv2.namedWindow("leftWristImg", cv2.WINDOW_GUI_EXPANDED)
             cv2.imshow("leftWristImg", Lbgr / 255.0)
             cv2.namedWindow("rightWristImg", cv2.WINDOW_GUI_EXPANDED)
@@ -1044,10 +1097,16 @@ def run_scene3(robot, arm, claw, head, log):
 
         
         if phase == "post_side_shift":
-            print(boxBPos)
+            target_dist = 320  # mm，距货架的期望深度
+            tolerance = 15     # mm，允许误差
             if boxClass == 1:
-                if abs(boxBPos) > 300:
+                dist = abs(boxBPos)
+                error = dist - target_dist
+                log(f"[INFO] post_side_shift dist={dist:.0f}mm error={error:.0f}mm")
+                if error > tolerance:
                     robot.move_forward(0.05)
+                elif error < -tolerance:
+                    robot.move_backward(0.05)
                 else:
                     robot.stop()
                     phase = "upper_hand_ready"
@@ -1089,28 +1148,40 @@ def run_scene3(robot, arm, claw, head, log):
             else:
                 right_arm = [30, 0, 0, -150, 90, 0, 0]
             arm.go_to_joints(left_arm + right_arm)
-            rospy.sleep(2.0)
+            rospy.sleep(6.0)
 
             if upper_joints == "left":
-                left_arm = [-10, 0, 0, -150, -90, 0, 0]
+                left_arm = [0, 0, 0, -150, -90, 0, 0]
             else:
-                right_arm = [-10, 0, 0, -150, 90, 0, 0]
+                right_arm = [0, 0, 0, -150, 90, 0, 0]
             arm.go_to_joints(left_arm + right_arm)
             rospy.sleep(3.0)
 
             if upper_joints == "left":
-                left_arm = [-20, 0, 0, -110, -90, -40, 0]
+                left_arm = [-10, 0, 0, -120, -90, -30, 0]
             else:
-                right_arm = [-20, 0, 0, -110, 90, 40, 0]
+                right_arm = [-10, 0, 0, -120, 90, 30, 0]
+            arm.go_to_joints(left_arm + right_arm)
+            rospy.sleep(4.0)
+
+            if upper_joints == "left":
+                left_arm = [-15, 0, 0, -115, -90, -30, 0]
+            else:
+                right_arm = [-15, 0, 0, -115, 90, 30, 0]
             arm.go_to_joints(left_arm + right_arm)
             rospy.sleep(5.0)
 
             log(f"[INFO] upper_hand_ready: {upper_joints} arm raised for upper layer")
             phase = "grab_upper_smt"
+            continue
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
         
         if phase == "grab_upper_smt":
             # 只校正当前抬起、准备抓取上层料盘的手，避免带动另一只手。
-            detection = wrist_tray_offsets.get(active_grab_hand)
+            detection = wrist_filter.get(active_grab_hand)
             if detection is None:
                 log(f"[INFO] {active_grab_hand} wrist: AABB ROI 内未检测到料盘")
             else:
@@ -1125,6 +1196,7 @@ def run_scene3(robot, arm, claw, head, log):
                     f"像素偏移=({pixelOffset[0]:.1f}, {pixelOffset[1]:.1f}), "
                     f"点数={detection['point_count']}")
 
+                cv2.waitKey(1)
                 if approach_basis is None:
                     log("[ERROR] wrist alignment: 缺少冻结的视觉 world basis")
                 else:
@@ -1139,7 +1211,7 @@ def run_scene3(robot, arm, claw, head, log):
                         log(f"[INFO] {active_grab_hand} wrist: 横向校正 "
                             f"{lateralOffsetMm:.1f}mm -> base Δ={deltaBaseM.tolist()} m")
                         arm.move_relative(active_grab_hand, deltaBaseM.tolist(),
-                                         max_error_m=0.03, sleep=1.5)
+                                          max_error_m=0.01, sleep=1.5)
 
                     if abs(forwardErrorMm) > WRIST_DEPTH_TOLERANCE_MM:
                         deltaBaseM = wristCameraVectorToBase(
@@ -1150,11 +1222,12 @@ def run_scene3(robot, arm, claw, head, log):
                         log(f"[INFO] {active_grab_hand} wrist: 前后校正 "
                             f"近边缘 {nearEdgeDepthMm:.1f}mm -> "
                             f"目标 {WRIST_DEPTH_TARGET_MM:.1f}mm, base Δ={deltaBaseM.tolist()} m")
-                        arm.move_relative(active_grab_hand, deltaBaseM.tolist(),
-                                         max_error_m=0.03, sleep=1.5)
+                        arm.move_relative_cartesian(active_grab_hand, deltaBaseM.tolist(),
+                                                    step_m=0.003, settle_s=0.3,
+                                                    max_error_m=0.005)
 
                     log(f"[INFO] {active_grab_hand} wrist: 校正完成，开始夹取")
-                    rospy.sleep(3.0)
+                    rospy.sleep(1.0)
                     phase = "close_upper_smt"
         if phase == "close_upper_smt":
             (claw.left_close() if active_grab_hand == "left" else claw.right_close())
@@ -1175,9 +1248,6 @@ def run_scene3(robot, arm, claw, head, log):
             log(f"[INFO] {active_grab_hand} arm: 已上提")
             phase = "upper_smt_lifted"
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
         rate.sleep()
     # cv2.destroyWindow("depth")
       
