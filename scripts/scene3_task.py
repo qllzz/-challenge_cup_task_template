@@ -726,11 +726,13 @@ def run_scene3(robot, arm, claw, head, log):
     approach_plan_locked = False
     active_grab_hand = None
     WRIST_ALIGN_TOLERANCE_MM = 8.0
-    WRIST_DEPTH_TARGET_MM = 60.0
+    WRIST_DEPTH_TARGET_MM = 50.0
     WRIST_DEPTH_TOLERANCE_MM = 10.0
     WRIST_ALIGN_MAX_STEP_M = 0.06
     LIFT_DISTANCE_M = 0.05
     wrist_filter = WristDetectionFilter(window=5)
+    grab_pass = 0
+    MAX_GRAB_PASSES = 2
 
     while not rospy.is_shutdown():
         objectBoundingBoxCorners = []
@@ -1158,20 +1160,34 @@ def run_scene3(robot, arm, claw, head, log):
             rospy.sleep(3.0)
 
             if upper_joints == "left":
-                left_arm = [-10, 0, 0, -120, -90, -30, 0]
+                left_arm = [-10, 0, 0, -125, -90, -35, 0]
             else:
-                right_arm = [-10, 0, 0, -120, 90, 30, 0]
+                right_arm = [-10, 0, 0, -125, 90, 35, 0]
             arm.go_to_joints(left_arm + right_arm)
             rospy.sleep(4.0)
 
-            if upper_joints == "left":
-                left_arm = [-15, 0, 0, -115, -90, -30, 0]
-            else:
-                right_arm = [-15, 0, 0, -115, 90, 30, 0]
-            arm.go_to_joints(left_arm + right_arm)
-            rospy.sleep(5.0)
+#            if upper_joints == "left":
+#                left_arm = [-15, 0, 0, -115, -90, -30, 0]
+#            else:
+#                right_arm = [-15, 0, 0, -115, 90, 30, 0]
+#            arm.go_to_joints(left_arm + right_arm)
+#            rospy.sleep(5.0)
 
             log(f"[INFO] upper_hand_ready: {upper_joints} arm raised for upper layer")
+            grab_pass = 0
+            # 快照抓取阶段的 base_link 末端位姿。后续横向/前向移动锁定同一
+            # 四元数与绝对 Z 高度，不能让每轮传感器 FK 的下垂状态变成新基准。
+            grab_ref_pose = arm.get_endpoint_pose(active_grab_hand)
+            if grab_ref_pose is None:
+                log(f"[ERROR] {active_grab_hand} 无法快照抓取参考位姿，停止任务")
+                robot.stop()
+                return
+            grab_ref_pos, grab_ref_quat = grab_ref_pose
+            grab_ref_z_m = grab_ref_pos[2]
+            log(f"[INFO] {active_grab_hand} 固定抓取位姿: "
+                f"Z={grab_ref_z_m:.3f}m, quat="
+                f"[{grab_ref_quat[0]:.4f}, {grab_ref_quat[1]:.4f}, "
+                f"{grab_ref_quat[2]:.4f}, {grab_ref_quat[3]:.4f}]")
             phase = "grab_upper_smt"
             continue
 
@@ -1188,6 +1204,7 @@ def run_scene3(robot, arm, claw, head, log):
                 offset = detection["offset_camera_mm"]
                 pixelOffset = detection["pixel_offset"]
                 lateralOffsetMm = float(offset[0])  # 腕相机光学帧 X：向右为正
+                verticalOffsetMm = float(offset[1])  # 腕相机光学帧 Y：向下为正
                 nearEdgeDepthMm = float(detection["near_edge_depth_mm"])
                 forwardErrorMm = nearEdgeDepthMm - WRIST_DEPTH_TARGET_MM
                 log(f"{active_grab_hand} 手腕实测→料盘: X={offset[0]:.0f}mm(右), "
@@ -1199,36 +1216,54 @@ def run_scene3(robot, arm, claw, head, log):
                 cv2.waitKey(1)
                 if approach_basis is None:
                     log("[ERROR] wrist alignment: 缺少冻结的视觉 world basis")
+                elif grab_ref_quat is None:
+                    # fail-closed：不允许退回到每轮实时 FK 姿态，否则下倾会被固化。
+                    log(f"[ERROR] {active_grab_hand} 缺少固定抓取姿态，跳过本轮移动")
                 else:
-                    handBasis = planLeftBasis if active_grab_hand == "left" else planRightBasis
+                    lateralOk = abs(lateralOffsetMm) <= WRIST_ALIGN_TOLERANCE_MM
+                    forwardOk = abs(forwardErrorMm) <= WRIST_DEPTH_TOLERANCE_MM
 
-                    if abs(lateralOffsetMm) > WRIST_ALIGN_TOLERANCE_MM:
-                        deltaBaseM = wristCameraVectorToBase(
-                            [lateralOffsetMm, 0.0, 0.0], handBasis, approach_basis, tf)
+                    # 高度锁定：不使用腕相机 Y 直接移动，由 target_z_m 强制锁定预备姿态的 Z。
+                    if lateralOk and forwardOk:
+                        log(f"[INFO] {active_grab_hand} wrist: 校正完成，开始夹取")
+                        rospy.sleep(1.0)
+                        phase = "close_upper_smt"
+                    elif grab_pass < MAX_GRAB_PASSES:
+                        correction_camera = [
+                            lateralOffsetMm if not lateralOk else 0.0,
+                            0.0,
+                            forwardErrorMm if not forwardOk else 0.0,
+                        ]
+                        # 本抓取策略要求“横向”严格为机器人左右、“前向”严格为
+                        # 机器人前后，不能用腕相机姿态旋转 correction_camera：手腕
+                        # 有 yaw/pitch 时，camera X/Z 会分别混入 base X/Y 分量。
+                        # optical X+ = 图像右；base_link Y+ = 机器人左。
+                        deltaBaseM = numpy.asarray([
+                            correction_camera[2] * 0.001,   # camera 前方 → base X+
+                            -correction_camera[0] * 0.001,  # camera 右方 → base Y-
+                            0.0,                             # 高度由 target_z_m 锁定
+                        ], dtype=numpy.float32)
                         deltaNorm = float(numpy.linalg.norm(deltaBaseM))
                         if deltaNorm > WRIST_ALIGN_MAX_STEP_M:
                             deltaBaseM *= WRIST_ALIGN_MAX_STEP_M / deltaNorm
-                        log(f"[INFO] {active_grab_hand} wrist: 横向校正 "
-                            f"{lateralOffsetMm:.1f}mm -> base Δ={deltaBaseM.tolist()} m")
-                        arm.move_relative(active_grab_hand, deltaBaseM.tolist(),
-                                          max_error_m=0.01, sleep=1.5)
-
-                    if abs(forwardErrorMm) > WRIST_DEPTH_TOLERANCE_MM:
-                        deltaBaseM = wristCameraVectorToBase(
-                            [0.0, 0.0, forwardErrorMm], handBasis, approach_basis, tf)
-                        deltaNorm = float(numpy.linalg.norm(deltaBaseM))
-                        if deltaNorm > WRIST_ALIGN_MAX_STEP_M:
-                            deltaBaseM *= WRIST_ALIGN_MAX_STEP_M / deltaNorm
-                        log(f"[INFO] {active_grab_hand} wrist: 前后校正 "
-                            f"近边缘 {nearEdgeDepthMm:.1f}mm -> "
-                            f"目标 {WRIST_DEPTH_TARGET_MM:.1f}mm, base Δ={deltaBaseM.tolist()} m")
+                        grab_pass += 1
+                        tag = "前伸+横向" if not forwardOk else "横向"
+                        log(f"[INFO] {active_grab_hand} wrist: {tag}校正 "
+                            f"第{grab_pass}/{MAX_GRAB_PASSES}次 "
+                            f"X={lateralOffsetMm:.1f} Y观测={verticalOffsetMm:.1f} "
+                            f"Z={forwardErrorMm:.1f} mm, 锁高={grab_ref_z_m:.3f}m "
+                            f"→ base Δ={deltaBaseM.tolist()} m")
                         arm.move_relative_cartesian(active_grab_hand, deltaBaseM.tolist(),
                                                     step_m=0.003, settle_s=0.3,
-                                                    max_error_m=0.005)
-
-                    log(f"[INFO] {active_grab_hand} wrist: 校正完成，开始夹取")
-                    rospy.sleep(1.0)
-                    phase = "close_upper_smt"
+                                                    max_error_m=0.03,
+                                                    quat_xyzw=grab_ref_quat,
+                                                    target_z_m=grab_ref_z_m)
+                    else:
+                        log(f"[INFO] {active_grab_hand} wrist: 已达最大"
+                            f"{MAX_GRAB_PASSES}次校正，"
+                            f"剩余 X={lateralOffsetMm:.1f} Y观测={verticalOffsetMm:.1f} "
+                            f"Z={forwardErrorMm:.1f} mm（高度锁定）")
+                        phase = "close_upper_smt"
         if phase == "close_upper_smt":
             (claw.left_close() if active_grab_hand == "left" else claw.right_close())
             claw.wait_until_done(timeout=3.0)

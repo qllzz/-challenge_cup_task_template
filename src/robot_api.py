@@ -26,11 +26,11 @@ import rospy
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
 from sensor_msgs.msg import JointState
-from kuavo_msgs.srv import controlLejuClaw, changeArmCtrlMode, twoArmHandPoseCmdSrv
+from kuavo_msgs.srv import controlLejuClaw, changeArmCtrlMode, twoArmHandPoseCmdSrv, fkSrv
 from kuavo_msgs.msg import (lejuClawState, endEffectorData,
                             twoArmHandPoseCmd, twoArmHandPose,
                             armHandPose, ikSolveParam,
-                            robotHeadMotionData)
+                            robotHeadMotionData, sensorsData)
 
 
 # ============================================================
@@ -246,6 +246,154 @@ class ArmController:
         self.go_to_joints(self.PRESETS["ready"])
         rospy.loginfo("手臂已到准备姿势")
 
+    # ---- 传感器关节读取 & FK ----
+
+    def _read_arm_joints_rad(self, timeout=2.0):
+        """从 /sensors_data_raw 读取 14 个手臂关节角（弧度）。"""
+        try:
+            msg = rospy.wait_for_message(
+                "/sensors_data_raw", sensorsData, timeout=timeout)
+        except Exception as exc:
+            rospy.logwarn("_read_arm_joints_rad: %s", exc)
+            return None
+        joint_q = list(msg.joint_data.joint_q)
+        if len(joint_q) >= 27:
+            return joint_q[13:27]
+        if len(joint_q) >= 26:
+            return joint_q[12:26]
+        rospy.logerr("_read_arm_joints_rad: joint_q 长度 %d 不足", len(joint_q))
+        return None
+
+    def call_fk(self, joint_angles_rad, timeout=5.0):
+        """FK 服务调用，输入 14 个关节角（弧度），返回 hand_poses。"""
+        rospy.wait_for_service("/ik/fk_srv", timeout=timeout)
+        resp = rospy.ServiceProxy("/ik/fk_srv", fkSrv)(list(joint_angles_rad))
+        if not resp.success:
+            rospy.logerr("call_fk: FK 服务返回 success=false")
+            return None
+        return resp.hand_poses
+
+    def get_endpoint_pose(self, hand, timeout=5.0):
+        """返回当前末端在 base_link 下的 (pos_xyz, quat_xyzw)，失败返回 None。"""
+        if hand not in ("left", "right"):
+            raise ValueError("get_endpoint_pose: hand 必须为 left 或 right")
+        q0 = self._read_arm_joints_rad()
+        if q0 is None or len(q0) != 14:
+            return None
+        fk = self.call_fk(q0, timeout=timeout)
+        if fk is None:
+            return None
+        pose = fk.left_pose if hand == "left" else fk.right_pose
+        return list(pose.pos_xyz), list(pose.quat_xyzw)
+
+    def get_endpoint_quat(self, hand, timeout=5.0):
+        """返回当前末端在 base_link 下的姿态四元数 [x,y,z,w]，失败返回 None。"""
+        pose = self.get_endpoint_pose(hand, timeout=timeout)
+        return None if pose is None else pose[1]
+
+    @staticmethod
+    def _ik_param(constraint_mode=None, pos_cost_weight=0.0,
+                  major_iterations_limit=500):
+        """构造自定义 IK 参数。"""
+        param = ikSolveParam()
+        param.major_optimality_tol = 1e-3
+        param.major_feasibility_tol = 1e-3
+        param.minor_feasibility_tol = 1e-3
+        param.major_iterations_limit = int(major_iterations_limit or 500)
+        param.oritation_constraint_tol = 1e-3
+        param.pos_constraint_tol = 1e-3
+        param.pos_cost_weight = float(pos_cost_weight or 0.0)
+        if constraint_mode is not None:
+            param.constraint_mode = int(constraint_mode)
+        return param
+
+    # ---- 带 constraint_mode 的单臂 IK ----
+
+    def solve_ik_one_hand(self, side, pos_xyz, quat_xyzw, frame=2,
+                          constraint_mode=None, pos_cost_weight=0.0,
+                          major_iterations_limit=500, timeout=5.0):
+        """
+        单臂 IK：只解指定手，另一只手用传感器实际关节角锁定。
+
+        参数:
+            side      — "left" 或 "right"
+            pos_xyz   — 目标位置 [x, y, z]，单位 米
+            quat_xyzw — 目标姿态 [x, y, z, w] 四元数
+            frame     — 目标位姿坐标系；2=local/base_link（默认）
+            constraint_mode — IK 约束模式 (0x03=位置、姿态均硬约束)；
+                              精密移动时不得使用姿态软约束 0x02
+            pos_cost_weight / major_iterations_limit — IK 精度参数
+
+        返回:
+            (success, q_arm_deg) — 14 个关节角度(度)
+        """
+        if side not in ("left", "right"):
+            raise ValueError("solve_ik_one_hand: side 必须为 left 或 right")
+
+        q0 = self._read_arm_joints_rad(timeout=timeout)
+        if q0 is None or len(q0) != 14:
+            rospy.logerr("solve_ik_one_hand: 无法从传感器读取当前关节角")
+            return False, []
+
+        fk = self.call_fk(q0, timeout=timeout)
+        if fk is None:
+            rospy.logerr("solve_ik_one_hand: FK 调用失败")
+            return False, []
+
+        req = twoArmHandPoseCmd()
+        # FK 位姿及 delta_xyz 都是 move_relative 的 local/base_link 语义，
+        # 必须显式设为 frame=2；不能依赖服务端默认 frame。
+        req.frame = frame
+        req.use_custom_ik_param = constraint_mode is not None
+        req.joint_angles_as_q0 = True
+        if req.use_custom_ik_param:
+            req.ik_param = self._ik_param(
+                constraint_mode, pos_cost_weight, major_iterations_limit)
+
+        req.hand_poses.left_pose.joint_angles = list(q0[:7])
+        req.hand_poses.right_pose.joint_angles = list(q0[7:])
+        req.hand_poses.left_pose.elbow_pos_xyz = [0.0, 0.0, 0.0]
+        req.hand_poses.right_pose.elbow_pos_xyz = [0.0, 0.0, 0.0]
+        req.hand_poses.left_pose.pos_xyz = list(fk.left_pose.pos_xyz)
+        req.hand_poses.left_pose.quat_xyzw = list(fk.left_pose.quat_xyzw)
+        req.hand_poses.right_pose.pos_xyz = list(fk.right_pose.pos_xyz)
+        req.hand_poses.right_pose.quat_xyzw = list(fk.right_pose.quat_xyzw)
+
+        target = (req.hand_poses.left_pose if side == "left"
+                  else req.hand_poses.right_pose)
+        if pos_xyz is not None:
+            target.pos_xyz = list(pos_xyz)
+        if quat_xyzw is not None:
+            target.quat_xyzw = list(quat_xyzw)
+
+        rospy.wait_for_service("/ik/two_arm_hand_pose_cmd_srv", timeout=timeout)
+        try:
+            resp = rospy.ServiceProxy(
+                "/ik/two_arm_hand_pose_cmd_srv", twoArmHandPoseCmdSrv)(req)
+        except rospy.ServiceException as e:
+            rospy.logerr("solve_ik_one_hand: IK 服务调用失败: %s", e)
+            return False, []
+
+        if not resp.success:
+            rospy.logerr("solve_ik_one_hand: IK 求解失败: %s",
+                         getattr(resp, "error_reason", ""))
+            return False, []
+
+        q_rad = list(q0[:14])
+        if side == "left":
+            jr = list(resp.hand_poses.left_pose.joint_angles)
+            if len(jr) != 7 and len(resp.q_arm) >= 7:
+                jr = list(resp.q_arm[:7])
+            if len(jr) == 7:
+                q_rad = jr + q_rad[7:]
+        else:
+            jr = list(resp.hand_poses.right_pose.joint_angles)
+            if len(jr) != 7 and len(resp.q_arm) >= 14:
+                jr = list(resp.q_arm[7:14])
+            if len(jr) == 7:
+                q_rad = q_rad[:7] + jr
+        return True, [math.degrees(q) for q in q_rad]
+
     # ---- 单臂快捷方法 ----
 
     def left_arm_to(self, joints):
@@ -442,6 +590,185 @@ class ArmController:
             rospy.sleep(sleep)
         return True
 
+    def move_relative_cartesian(self, hand, delta_xyz,
+                                 step_m=0.005, settle_s=0.35,
+                                 max_error_m=0.005,
+                                 max_orientation_error_rad=math.radians(3.0),
+                                 constraint_modes=None,
+                                 quat_xyzw=None, target_z_m=None):
+        """
+        笛卡尔直线相对位移：FK 当前末端 → 在起终点间插值 N 个 waypoint →
+        逐点 IK → 依次下发，避免关节空间插补产生的横向漂移。
+
+        坐标系: base_link (frame=2), 原点 = 机器人基座中心
+
+            X+ : 机器人正前方  (前进方向)
+            Y+ : 机器人左侧    (左手方向)
+            Z+ : 机器人上方    (竖直向上)
+
+        参数:
+            hand        — "left" 或 "right"
+            delta_xyz   — 相对位移 [dx, dy, dz]，单位 米，base_link 系
+            step_m      — 每段最大步长（默认 5 mm）
+            settle_s    — 每段到位后等待秒数
+            max_error_m — 单步 IK 位置残差上限（默认 5 mm）
+            max_orientation_error_rad — 单步 FK 姿态误差上限（默认 3°）
+            constraint_modes — IK 模式列表，默认仅 [0x03]（位置、姿态硬约束）。
+                              为防夹爪倾斜，默认不回退到姿态软约束 0x02。
+            quat_xyzw   — 可选，手动指定末端目标姿态 [x,y,z,w]（base_link 系）。
+                          传入则锁定此姿态不动；不传则从传感器 FK 读取当前姿态。
+            target_z_m  — 可选，base_link 下的末端绝对目标高度（米）。传入后，
+                          无论当前传感器 FK 高度或 delta_xyz 的 Z 分量为何，终点
+                          都强制为该高度；用于横向/前向移动期间防止整臂下垂。
+
+        返回:
+            True / False
+
+        示例:
+            arm.move_relative_cartesian("right", [0.10, 0.0, 0.0])   # 前伸 10cm
+            arm.move_relative_cartesian("right", [-0.05, 0.0, 0.0])  # 后收 5cm
+            arm.move_relative_cartesian("right", [0.0, 0.0, 0.03])   # 上抬 3cm
+        """
+        if hand not in ("left", "right"):
+            rospy.logerr("move_relative_cartesian: hand 必须为 left 或 right")
+            return False
+
+        if constraint_modes is None:
+            # 安全优先：姿态硬约束不能满足就中止，不能以夹爪下垂换取位置可达。
+            constraint_modes = [0x03]
+
+        dt = settle_s
+
+        # 从传感器读取实际关节角并 FK 得到当前末端位置
+        q0 = self._read_arm_joints_rad()
+        if q0 is None or len(q0) != 14:
+            rospy.logerr("move_relative_cartesian: 无法读取传感器关节角")
+            return False
+
+        fk = self.call_fk(q0, timeout=5.0)
+        if fk is None:
+            rospy.logerr("move_relative_cartesian: FK 失败")
+            return False
+
+        if hand == "left":
+            start = list(fk.left_pose.pos_xyz)
+            quat = list(fk.left_pose.quat_xyzw) if quat_xyzw is None else list(quat_xyzw)
+        else:
+            start = list(fk.right_pose.pos_xyz)
+            quat = list(fk.right_pose.quat_xyzw) if quat_xyzw is None else list(quat_xyzw)
+
+        end = [start[j] + delta_xyz[j] for j in range(3)]
+        if target_z_m is None:
+            total_dist = math.sqrt(sum((end[j] - start[j]) ** 2 for j in range(3)))
+            n = max(1, int(math.ceil(total_dist / step_m)))
+            waypoints = [
+                [start[j] + (end[j] - start[j]) * float(i) / float(n)
+                 for j in range(3)]
+                for i in range(1, n + 1)
+            ]
+            path_desc = ""
+        else:
+            # 高度锁定轨迹不能把下垂恢复与 XY 移动混成斜线：先在原 XY
+            # 原地回到参考高度，再在固定 Z 平面内完成横向/前向运动。
+            end[2] = float(target_z_m)
+            vertical_dist = abs(end[2] - start[2])
+            planar_dist = math.sqrt(
+                (end[0] - start[0]) ** 2 + (end[1] - start[1]) ** 2)
+            vertical_n = int(math.ceil(vertical_dist / step_m))
+            planar_n = int(math.ceil(planar_dist / step_m))
+            waypoints = []
+            for i in range(1, vertical_n + 1):
+                a = float(i) / float(vertical_n)
+                waypoints.append([start[0], start[1],
+                                  start[2] + (end[2] - start[2]) * a])
+            for i in range(1, planar_n + 1):
+                a = float(i) / float(planar_n)
+                waypoints.append([
+                    start[0] + (end[0] - start[0]) * a,
+                    start[1] + (end[1] - start[1]) * a,
+                    end[2],
+                ])
+            if not waypoints:
+                waypoints = [end]
+            n = len(waypoints)
+            path_desc = " (Z locked: vertical %d + planar %d)" % (
+                vertical_n, planar_n)
+
+        rospy.loginfo("move_relative_cartesian: %s %d段 %.1fmm/段 "
+                      "start=%s end=%s%s",
+                      hand, n, step_m * 1000.0, start, end, path_desc)
+
+        for i, pt in enumerate(waypoints, 1):
+
+            ok = False
+            joints = []
+            used_mode = None
+            for mode in constraint_modes:
+                try:
+                    ok, joints = self.solve_ik_one_hand(
+                        hand, pt, quat, frame=2,
+                        constraint_mode=mode,
+                        pos_cost_weight=0.0,
+                        major_iterations_limit=500)
+                except Exception as exc:
+                    rospy.logwarn(
+                        "move_relative_cartesian: IK mode=%s 异常: %s",
+                        mode, exc)
+                    continue
+                used_mode = mode
+                if ok:
+                    break
+
+            if not ok:
+                rospy.logerr(
+                    "move_relative_cartesian: 第 %d/%d 步 IK 失败 (mode=%s)",
+                    i, n, used_mode)
+                return False
+
+            # FK 验证位置误差
+            solved_fk = self.call_fk(
+                [math.radians(q) for q in joints], timeout=5.0)
+            if solved_fk is None:
+                rospy.logerr(
+                    "move_relative_cartesian: 第 %d/%d 步 FK 验证失败", i, n)
+                return False
+
+            solved_pos = (list(solved_fk.left_pose.pos_xyz) if hand == "left"
+                          else list(solved_fk.right_pose.pos_xyz))
+            error_m = math.sqrt(
+                sum((solved_pos[j] - pt[j]) ** 2 for j in range(3)))
+            if error_m > max_error_m:
+                rospy.logerr(
+                    "move_relative_cartesian: 第 %d/%d 步 IK 残差 "
+                    "%.1f mm > %.0f mm，拒绝执行",
+                    i, n, error_m * 1000.0, max_error_m * 1000.0)
+                return False
+
+            solved_quat = (list(solved_fk.left_pose.quat_xyzw)
+                           if hand == "left"
+                           else list(solved_fk.right_pose.quat_xyzw))
+            target_norm = math.sqrt(sum(value * value for value in quat))
+            solved_norm = math.sqrt(sum(value * value for value in solved_quat))
+            if target_norm <= 1e-9 or solved_norm <= 1e-9:
+                rospy.logerr("move_relative_cartesian: 第 %d/%d 步四元数无效", i, n)
+                return False
+            # q 与 -q 表示同一旋转，所以取 dot 的绝对值。
+            dot = abs(sum(a * b for a, b in zip(quat, solved_quat)) /
+                      (target_norm * solved_norm))
+            orientation_error = 2.0 * math.acos(min(1.0, max(-1.0, dot)))
+            if orientation_error > max_orientation_error_rad:
+                rospy.logerr(
+                    "move_relative_cartesian: 第 %d/%d 步末端姿态偏差 %.1f° > %.1f°，"
+                    "拒绝执行以防夹爪倾斜",
+                    i, n, math.degrees(orientation_error),
+                    math.degrees(max_orientation_error_rad))
+                return False
+
+            self.apply_ik_single_arm_solution(hand, joints)
+            rospy.sleep(dt)
+
+        return True
+
     def fk(self, joints_deg=None):
         """
         正运动学：给定 14 个关节角，返回双手末端位姿。
@@ -517,10 +844,11 @@ class ArmController:
             return False, []
 
         # IK 服务在目标超出工作空间时仍可能返回 success=True 和一组饱和
-        # 关节角。必须用 FK 验证目标侧的位置误差，避免执行明显偏离的解。
-        solved_lp, _, solved_rp, _ = self.fk(q_arm)
+        # 关节角。必须用 FK 验证目标侧的位置误差和姿态误差，避免执行明显偏离的解。
+        solved_lp, solved_lq, solved_rp, solved_rq = self.fk(q_arm)
         solved_pos = solved_lp if hand == "left" else solved_rp
-        if solved_pos is None:
+        solved_quat = solved_lq if hand == "left" else solved_rq
+        if solved_pos is None or solved_quat is None:
             rospy.logerr("solve_ik_single_arm: 无法验证 IK 解的 FK 结果")
             return False, []
 
@@ -537,6 +865,22 @@ class ArmController:
             rospy.logerr("solve_ik_single_arm: IK 残差 %.1f mm > %.0f mm，拒绝执行",
                          error_m * 1000.0, max_error_m * 1000.0)
             return False, []
+
+        # 检查姿态偏差（与 move_relative_cartesian 保持一致）
+        target_quat = [float(v) for v in quat_xyzw]
+        target_norm = math.sqrt(sum(v * v for v in target_quat))
+        solved_norm = math.sqrt(sum(v * v for v in solved_quat))
+        if target_norm > 1e-9 and solved_norm > 1e-9:
+            dot = abs(sum(a * b for a, b in zip(target_quat, solved_quat))
+                      / (target_norm * solved_norm))
+            orientation_error_rad = 2.0 * math.acos(min(1.0, max(-1.0, dot)))
+            max_orientation_error_rad = math.radians(3.0)
+            if orientation_error_rad > max_orientation_error_rad:
+                rospy.logerr(
+                    "solve_ik_single_arm: FK 姿态偏差 %.1f° > %.1f°，拒绝执行",
+                    math.degrees(orientation_error_rad),
+                    math.degrees(max_orientation_error_rad))
+                return False, []
 
         return True, q_arm
 
