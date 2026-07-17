@@ -8,7 +8,7 @@ try:
     import cv2
 except ImportError:
     cv2 = None
- 
+
 from perception_api import CameraReader, SensorReader, TFReader
 from sensor_msgs.msg import CameraInfo
 
@@ -128,7 +128,8 @@ def getHandOrigin(headBasis, tfReader, timeout=1.0):
     rightCenter = getSingleCenter(RIGHT_WRIST_CAMERA_FRAME)
     return leftCenter, rightCenter
 
-def planTrayApproach(tray_infos, basis, tf_reader, timeout=1.0):
+def planTrayApproach(tray_infos, basis, tf_reader, timeout=1.0,
+                     pair_slots=None):
     """
     给定所有检测到的料盘信息，计算最优站位和左右手分配，使机器人仅需
     蹲起 + 手臂微调即可同时够到上下层各一个料盘。
@@ -139,9 +140,12 @@ def planTrayApproach(tray_infos, basis, tf_reader, timeout=1.0):
             "y_center_world_mm"  : 视觉世界系 Y 坐标 (mm)
             "x_center_world_mm"  : 视觉世界系 X 坐标 (mm)
             "z_top_world_mm"     : 料盘顶面 Z 坐标 (mm)
+            "slot_index"         : 同层按世界 Y 从小到大排列的固定槽位编号
         basis       : (3,3) 视觉世界系 basis 矩阵
         tf_reader   : TFReader 实例
         timeout     : TF 超时 (秒)
+        pair_slots  : None，或 {0: 下层 slot_index, 1: 上层 slot_index}。
+                      指定后强制使用这对槽位，避免对称构型的最优解跳变。
 
     返回:
         None (tf 失败或无可用配对时)
@@ -165,7 +169,9 @@ def planTrayApproach(tray_infos, basis, tf_reader, timeout=1.0):
         ], dtype=numpy.float32)
         trays_by_layer[t["layer"]].append({
             "layer": t["layer"],
+            "slot_index": t.get("slot_index"),
             "center_world_mm": center_world,
+            "virtual": t.get("virtual", False),
             # 保留原始检测 AABB，供后续腕相机空间门限使用。
             "aabb_world_mm": t.get("aabb_world_mm"),
         })
@@ -174,22 +180,28 @@ def planTrayApproach(tray_infos, basis, tf_reader, timeout=1.0):
     if not trays_by_layer[0] or not trays_by_layer[1]:
         return None
 
-    # ---- 2. 枚举跨层配对，找 |ΔY| 最接近肩宽的一对 ----
-    best_pair = None
-    best_score = float("inf")
-
-    for lo in trays_by_layer[0]:
-        for hi in trays_by_layer[1]:
-            dy = abs(lo["center_world_mm"][1] - hi["center_world_mm"][1])
-            score = abs(dy - SHOULDER_WIDTH)
-            if score < best_score:
-                best_score = score
-                best_pair = (lo, hi)
-
-    if best_pair is None:
-        return None
-
-    lo, hi = best_pair
+    # ---- 2. 首次规划后锁定槽位配对，消除对称构型的等价最优解跳变 ----
+    if pair_slots is not None:
+        lo = next((tray for tray in trays_by_layer[0]
+                   if tray["slot_index"] == pair_slots[0]), None)
+        hi = next((tray for tray in trays_by_layer[1]
+                   if tray["slot_index"] == pair_slots[1]), None)
+        if lo is None or hi is None:
+            return None
+    else:
+        best_pair = None
+        best_score = float("inf")
+        for lo_candidate in trays_by_layer[0]:
+            for hi_candidate in trays_by_layer[1]:
+                dy = abs(lo_candidate["center_world_mm"][1] -
+                         hi_candidate["center_world_mm"][1])
+                score = abs(dy - SHOULDER_WIDTH)
+                if score < best_score:
+                    best_score = score
+                    best_pair = (lo_candidate, hi_candidate)
+        if best_pair is None:
+            return None
+        lo, hi = best_pair
     y_lo = lo["center_world_mm"][1]
     y_hi = hi["center_world_mm"][1]
 
@@ -291,25 +303,25 @@ def posToNormal(pos, depth):
     horiFactor = getDiffBlendFactor(depthAbsDiffR - depthAbsDiffL, 0.1)[..., numpy.newaxis]
     vertFactor = getDiffBlendFactor(depthAbsDiffB - depthAbsDiffT, 0.1)[..., numpy.newaxis]
 
-    posT  = posWithPadding[:-2, 1:-1] 
-    posL  = posWithPadding[1:-1, :-2] 
-    posR  = posWithPadding[1:-1, 2:]  
-    posB  = posWithPadding[2:, 1:-1] 
+    posT  = posWithPadding[:-2, 1:-1]
+    posL  = posWithPadding[1:-1, :-2]
+    posR  = posWithPadding[1:-1, 2:]
+    posB  = posWithPadding[2:, 1:-1]
 
     Tu = ( posR - pos ) * horiFactor + ( pos - posL ) * (1.0 - horiFactor)
     Tv = ( posB - pos ) * vertFactor + ( pos - posT ) * (1.0 - vertFactor)
-    
+
     normal_raw = numpy.cross(Tv, Tu, axis=2)
     norm = numpy.linalg.norm(normal_raw, axis=2, keepdims=True)
     normal = normal_raw / norm
-    
+
     return normal
 
 def getAvgDir(vectors):
     mean = numpy.sum(vectors, axis=0)
     mean /= numpy.linalg.norm(mean)
     dots = vectors @ mean
-    threshold = numpy.percentile(dots, 10)  
+    threshold = numpy.percentile(dots, 10)
     mask = dots >= threshold
     final = numpy.sum(vectors[mask], axis=0)
     final /= numpy.linalg.norm(final)
@@ -331,7 +343,7 @@ def hsvKey(hsv_image, hsv_color, tolerances):
     v_low = numpy.clip(v_center - v_tol, 0, V_MAX).astype(numpy.uint8)
     v_high = numpy.clip(v_center + v_tol, 0, V_MAX).astype(numpy.uint8)
 
-    mask = numpy.zeros(hsv_image.shape[:2], dtype=numpy.uint8)  
+    mask = numpy.zeros(hsv_image.shape[:2], dtype=numpy.uint8)
     h_low_raw = h_center - h_tol
     h_high_raw = h_center + h_tol
 
@@ -426,6 +438,14 @@ class WristDetectionFilter(object):
         buf.append(detection)
         if len(buf) > self._window:
             buf.pop(0)
+
+    def clear(self, hand=None):
+        """丢弃移动前的观测；hand=None 时清空双手。"""
+        if hand is None:
+            for buf in self._buf.values():
+                buf.clear()
+        else:
+            self._buf[hand].clear()
 
     def get(self, hand):
         """返回窗口内中位数滤波后的检测结果，全为 None 时返回 None。"""
@@ -693,6 +713,42 @@ def run_scene3(robot, arm, claw, head, log):
     sensor = SensorReader()
     tf = TFReader()
 
+    # /kuavo_arm_traj 的 14 个 position 是双臂的绝对目标。下层右手
+    # 抓取出现关节异常时，需要同时记录“下发目标”和传感器实测，不能只看
+    # 画面或误用错位后的 joint_q 切片。
+    arm_joint_names = [
+        "l_arm_pitch", "l_arm_roll", "l_arm_yaw", "l_forearm_pitch",
+        "l_hand_yaw", "l_hand_pitch", "l_hand_roll",
+        "r_arm_pitch", "r_arm_roll", "r_arm_yaw", "r_forearm_pitch",
+        "r_hand_yaw", "r_hand_pitch", "r_hand_roll",
+    ]
+
+    def trace_lower_arm_command(stage, left_joints, right_joints):
+        target = list(left_joints) + list(right_joints)
+        actual = sensor.get_arm_joint_degrees()
+        if actual is None or len(actual) != 14:
+            log(f"[TRACE] lower_arm_ready/{stage}: sensor unavailable; "
+                f"right target={right_joints}")
+        else:
+            right_actual = actual[7:14]
+            right_delta = [target[7 + i] - right_actual[i] for i in range(7)]
+            log(f"[TRACE] lower_arm_ready/{stage}: right actual="
+                f"{[round(v, 1) for v in right_actual]}, target={right_joints}, "
+                f"command_delta={[round(v, 1) for v in right_delta]}")
+            log(f"[TRACE] lower_arm_ready/{stage}: "
+                f"{arm_joint_names[8]} (right r2/global 8) "
+                f"{right_actual[1]:.1f}° -> {right_joints[1]:.1f}°")
+        arm.go_to_joints(target)
+
+    def trace_lower_arm_feedback(stage):
+        actual = sensor.get_arm_joint_degrees()
+        if actual is None or len(actual) != 14:
+            log(f"[TRACE] lower_arm_ready/{stage}: no post-command sensor data")
+            return
+        log(f"[TRACE] lower_arm_ready/{stage}: right post="
+            f"{[round(v, 1) for v in actual[7:14]]}; "
+            f"{arm_joint_names[8]}={actual[8]:.1f}°")
+
     headFX = headCamInfo.K[0]
     headFY = headCamInfo.K[4]
     headCX = headCamInfo.K[2]
@@ -716,7 +772,12 @@ def run_scene3(robot, arm, claw, head, log):
     kernel55 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5), anchor=None)
     kernel77 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7), anchor=None)
 
+    # 每层物理槽位数固定；slot_index 按同层世界 Y 从小到大编号。
+    # 已抓走的槽位仍作为规划中的虚拟料盘保留，以维持上下层配对关系。
     layerRemainCount = [2, 3]
+    picked_tray_slots = {0: set(), 1: set()}
+    # 首帧从等价候选中选定一次上下层槽位配对；任务结束前不再重选。
+    approach_pair_slots = None
     phase = "walk_to_shelf"
     initial_tangent = None
     # 料盘 AABB 与 basis 必须成对缓存。抬臂后头相机被 selfRadius 遮挡，
@@ -728,11 +789,14 @@ def run_scene3(robot, arm, claw, head, log):
     WRIST_ALIGN_TOLERANCE_MM = 8.0
     WRIST_DEPTH_TARGET_MM = 50.0
     WRIST_DEPTH_TOLERANCE_MM = 10.0
-    WRIST_ALIGN_MAX_STEP_M = 0.06
+    WRIST_ALIGN_MAX_STEP_M = 0.06       # 前向单轮总位移上限
+    WRIST_LATERAL_GAIN = 0.6            # 横向阻尼，避免按完整视觉误差超调
     LIFT_DISTANCE_M = 0.05
     wrist_filter = WristDetectionFilter(window=5)
-    grab_pass = 0
+    # 每个校正阶段各自使用这份基础次数，额外次数按该阶段初始误差计算。
     MAX_GRAB_PASSES = 2
+
+    current_grab_layer = 1
 
     while not rospy.is_shutdown():
         objectBoundingBoxCorners = []
@@ -807,7 +871,7 @@ def run_scene3(robot, arm, claw, head, log):
                 nextTangent = singleRef
         groundTangent = nextTangent
         groundBitangent = numpy.cross(groundNormal, groundTangent)
-        
+
         # worldNormal = numpy.stack([
         #     numpy.sum(normal * groundTangent, axis=-1),
         #     numpy.sum(normal * groundBitangent, axis=-1),
@@ -824,7 +888,7 @@ def run_scene3(robot, arm, claw, head, log):
         # cv2.imshow("normalDotVert", normalVertMask)
         bgr = bgr.astype(numpy.float32)
         turnThreshold = 0.2
-        
+
         ROI = validMask.copy()
         backFurthest = maskedFuzzyMax(worldPos, validMask, 0, epsilon=200)
         if numpy.dot(getAvgDir(normal[backFurthest]), groundNormal) < turnThreshold:
@@ -836,14 +900,14 @@ def run_scene3(robot, arm, claw, head, log):
             ROI[frontFurthest] = 0
         leftFurthest = maskedFuzzyMin(worldPos, validMask, 1, epsilon=200)
         if numpy.dot(getAvgDir(normal[leftFurthest]), groundNormal) < turnThreshold:
-            bgr[leftFurthest] = (bgr[leftFurthest] * numpy.array([1, 2, 2]))  
+            bgr[leftFurthest] = (bgr[leftFurthest] * numpy.array([1, 2, 2]))
             ROI[leftFurthest] = 0
         rightFurthest = maskedFuzzyMax(worldPos, validMask, 1, epsilon=200)
         if numpy.dot(getAvgDir(normal[rightFurthest]), groundNormal) < turnThreshold:
-            bgr[rightFurthest] = (bgr[rightFurthest] * numpy.array([1, 2, 2]))  
+            bgr[rightFurthest] = (bgr[rightFurthest] * numpy.array([1, 2, 2]))
             ROI[rightFurthest] = 0
         downFurthest = maskedFuzzyMin(worldPos, validMask, 2, epsilon=120)
-        bgr[downFurthest] = (bgr[downFurthest] * numpy.array([2, 1, 2]))  
+        bgr[downFurthest] = (bgr[downFurthest] * numpy.array([2, 1, 2]))
         ROI[downFurthest] = 0
 
         selfRadius = 175
@@ -889,14 +953,26 @@ def run_scene3(robot, arm, claw, head, log):
                 layerMask[i] = getAABBMask([boxFPos + 134, boxLPos + 100, boxDPos + layerBottom[i] + cullDistThreshold], [boxBPos, boxRPos - 100, boxDPos + layerTop[i]], worldPos).astype(numpy.uint8)
                 u, v = numpy.where(layerMask[i])
                 trayVecs = (worldPos[layerMask[i] != 0][:, 1:2]).astype(numpy.float32)
-                _, labels, centers = cv2.kmeans(trayVecs, layerRemainCount[i], None, (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 100, 0.001), 5, cv2.KMEANS_PP_CENTERS)
+                # 已取走的槽位不应再要求 k-means 在空位上强行分出一类；
+                # 其索引会在下方以虚拟料盘补回给规划器。
+                visible_slots = [slot for slot in range(layerRemainCount[i])
+                                 if slot not in picked_tray_slots[i]]
+                visible_count = len(visible_slots)
+                if visible_count == 0 or len(trayVecs) < visible_count:
+                    continue
+
+                _, labels, centers = cv2.kmeans(
+                    trayVecs, visible_count, None,
+                    (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER,
+                     100, 0.001), 5, cv2.KMEANS_PP_CENTERS)
                 markColors = [[2, 0.3, 0.3], [0.3, 2, 0.3], [0.3, 0.3, 2]]
                 orderMap = numpy.argsort(centers[:, 0])
-                for j in range(layerRemainCount[i]):
+                visible_layer_infos = []
+                for j, slot_index in enumerate(visible_slots):
                     singleMask = labels[:, 0] == orderMap[j]
                     targetU = u[singleMask]
                     targetV = v[singleMask]
-                    bgr[targetU, targetV] = bgr[targetU, targetV] * markColors[j]
+                    bgr[targetU, targetV] = bgr[targetU, targetV] * markColors[slot_index]
                     LBoundary = numpy.min(worldPos[targetU, targetV][:, 1])
                     RBoundary = numpy.max(worldPos[targetU, targetV][:, 1])
                     FBoundary = numpy.min(worldPos[targetU, targetV][:, 0])
@@ -904,8 +980,9 @@ def run_scene3(robot, arm, claw, head, log):
                     UBoundary = numpy.max(worldPos[targetU, targetV][:, 2])
                     # markAABB(bgr, basis, headFX, headFY, headCX, headCY, [FBoundary, LBoundary, UBoundary + FBoundary - BBoundary], [BBoundary, RBoundary, UBoundary])
                     objectBoundingBoxCorners.append([[FBoundary, LBoundary, UBoundary + FBoundary - BBoundary], [BBoundary, RBoundary, UBoundary]])
-                    tray_infos.append({
+                    tray_info = {
                         "layer": i,
+                        "slot_index": slot_index,
                         "y_center_world_mm": float(centers[orderMap[j], 0]),
                         "x_center_world_mm": float((FBoundary + BBoundary) / 2.0),
                         "z_center_world_mm": float(UBoundary + (FBoundary - BBoundary) / 2.0),
@@ -915,6 +992,54 @@ def run_scene3(robot, arm, claw, head, log):
                             numpy.array([FBoundary, LBoundary, UBoundary + FBoundary - BBoundary], dtype=numpy.float32),
                             numpy.array([BBoundary, RBoundary, UBoundary], dtype=numpy.float32),
                         ),
+                    }
+                    visible_layer_infos.append(tray_info)
+                    tray_infos.append(tray_info)
+
+                # 重建已取走槽位的当前相机坐标：以其余槽位的相对 index 间距
+                # 插值/外推。虚拟料盘只用于上下层配对，没有 AABB，故不会被
+                # 腕相机当作实际抓取目标。
+                for missing_slot in sorted(picked_tray_slots[i]):
+                    reference = min(
+                        visible_layer_infos,
+                        key=lambda tray: abs(tray["slot_index"] - missing_slot))
+                    reference_center = numpy.array([
+                        reference["x_center_world_mm"],
+                        reference["y_center_world_mm"],
+                        reference["z_center_world_mm"],
+                    ], dtype=numpy.float32)
+                    if len(visible_layer_infos) > 1:
+                        ordered_infos = sorted(
+                            visible_layer_infos, key=lambda tray: tray["slot_index"])
+                        per_slot_steps = []
+                        for left_info, right_info in zip(ordered_infos, ordered_infos[1:]):
+                            left_center = numpy.array([
+                                left_info["x_center_world_mm"],
+                                left_info["y_center_world_mm"],
+                                left_info["z_center_world_mm"],
+                            ], dtype=numpy.float32)
+                            right_center = numpy.array([
+                                right_info["x_center_world_mm"],
+                                right_info["y_center_world_mm"],
+                                right_info["z_center_world_mm"],
+                            ], dtype=numpy.float32)
+                            per_slot_steps.append(
+                                (right_center - left_center) /
+                                (right_info["slot_index"] - left_info["slot_index"]))
+                        slot_step = numpy.median(numpy.stack(per_slot_steps), axis=0)
+                    else:
+                        slot_step = numpy.zeros(3, dtype=numpy.float32)
+                    ghost_center = reference_center + (
+                        missing_slot - reference["slot_index"]) * slot_step
+                    tray_infos.append({
+                        "layer": i,
+                        "slot_index": missing_slot,
+                        "y_center_world_mm": float(ghost_center[1]),
+                        "x_center_world_mm": float(ghost_center[0]),
+                        "z_center_world_mm": float(ghost_center[2]),
+                        "z_top_world_mm": float(ghost_center[2]),
+                        "aabb_world_mm": None,
+                        "virtual": True,
                     })
         elif boxClass == 2:
             cullDistThreshold = 50
@@ -937,10 +1062,19 @@ def run_scene3(robot, arm, claw, head, log):
         # 抬臂后头部画面会被 selfRadius 内的机械臂遮挡；此时绝不能用
         # 当前帧的错误 box/basis 覆盖供腕相机使用的目标坐标。
         if boxClass == 1 and not approach_plan_locked:
-            candidate_plan = planTrayApproach(tray_infos, basis, tf)
+            candidate_plan = planTrayApproach(
+                tray_infos, basis, tf, pair_slots=approach_pair_slots)
             if candidate_plan is not None:
                 approach_plan = candidate_plan
                 approach_basis = basis.copy()
+                if approach_pair_slots is None:
+                    approach_pair_slots = {
+                        tray["layer"]: tray["slot_index"]
+                        for tray in candidate_plan["trays"]
+                    }
+                    log(f"[INFO] 锁定上下层槽位配对: "
+                        f"lower={approach_pair_slots[0]}, "
+                        f"upper={approach_pair_slots[1]}")
 
         leftBasis, rightBasis = getHandBasis(basis, tf)
         leftOrigin, rightOrigin = getHandOrigin(basis, tf)
@@ -964,8 +1098,8 @@ def run_scene3(robot, arm, claw, head, log):
         rasterizeSegment(bgr, camFrontPoint, camFrontPoint + [0, 0.1, 0], basis, headFX, headFY, headCX, headCY, [0, 0, 255], 2)
         rasterizeSegment(bgr, camFrontPoint, camFrontPoint + [0.1, 0, 0], basis, headFX, headFY, headCX, headCY, [255, 0, 0], 2)
         rasterizeSegment(bgr, camFrontPoint, camFrontPoint + [0, 0, 0.1], basis, headFX, headFY, headCX, headCY, [0, 255, 0], 2)
-                
-        
+
+
         # cv2.imshow("gNormalImg", numpy.dot(normal, groundNormal))
         # cv2.imshow("gTangentImg", numpy.dot(normal, groundTangent))
         # cv2.imshow("gBitangentImg", numpy.dot(normal, groundBitangent))
@@ -1072,14 +1206,20 @@ def run_scene3(robot, arm, claw, head, log):
             else:
                 robot.stop()
                 log(f"[ERROR] {phase}: shelf not found")
-        
+
         if phase == "side_shift":
-            assert(approach_plan)
+            # 第二次抓取刚解锁旧快照时，至少等一帧有效货架检测重建 plan；
+            # 不使用旧的相机原点坐标，也不能因偶发漏检直接 assert 退出。
+            if approach_plan is None:
+                robot.stop()
+                log("[INFO] side_shift: waiting for a fresh tray approach plan")
+                rate.sleep()
+                continue
 
             upper_joints = None
             upper_tray_y = None
             for tray in approach_plan["trays"]:
-                if tray["layer"] == 1:
+                if tray["layer"] == current_grab_layer:
                     upper_joints = tray["hand"]   # 记录"left"或"right"
                     upper_tray_y = tray["center_world_mm"][1]
 
@@ -1096,8 +1236,21 @@ def run_scene3(robot, arm, claw, head, log):
                 elif boxClass == 1:
                     robot.stop()
                     phase = "post_side_shift"
+            elif upper_joints == "right":
+                off = upper_tray_y - SHOULDER_WIDTH/2
+                log(f"[INFO] {phase} off: {off}")
+                if abs(off) > 10:
+                    robot.move_right(0.05 * abs(off) / off)
+                elif abs(off) > 5:
+                    robot.move_right(0.03 * abs(off) / off)
+                elif boxClass == 1:
+                    robot.stop()
+                    phase = "post_side_shift"
+            else:
+                log(f"[ERROR] {phase}: unexpected upper_joints={upper_joints}")
+                robot.stop()
 
-        
+
         if phase == "post_side_shift":
             target_dist = 320  # mm，距货架的期望深度
             tolerance = 15     # mm，允许误差
@@ -1111,7 +1264,10 @@ def run_scene3(robot, arm, claw, head, log):
                     robot.move_backward(0.05)
                 else:
                     robot.stop()
-                    phase = "upper_hand_ready"
+                    if current_grab_layer == 1:
+                        phase = "upper_hand_ready"
+                    elif current_grab_layer == 0:
+                        phase = "lower_hand_ready"
 
         if phase == "upper_hand_ready":
             assert(approach_plan)
@@ -1166,36 +1322,160 @@ def run_scene3(robot, arm, claw, head, log):
             arm.go_to_joints(left_arm + right_arm)
             rospy.sleep(4.0)
 
-#            if upper_joints == "left":
-#                left_arm = [-15, 0, 0, -115, -90, -30, 0]
-#            else:
-#                right_arm = [-15, 0, 0, -115, 90, 30, 0]
-#            arm.go_to_joints(left_arm + right_arm)
-#            rospy.sleep(5.0)
-
             log(f"[INFO] upper_hand_ready: {upper_joints} arm raised for upper layer")
-            grab_pass = 0
-            # 快照抓取阶段的 base_link 末端位姿。后续横向/前向移动锁定同一
-            # 四元数与绝对 Z 高度，不能让每轮传感器 FK 的下垂状态变成新基准。
-            grab_ref_pose = arm.get_endpoint_pose(active_grab_hand)
-            if grab_ref_pose is None:
-                log(f"[ERROR] {active_grab_hand} 无法快照抓取参考位姿，停止任务")
-                robot.stop()
-                return
-            grab_ref_pos, grab_ref_quat = grab_ref_pose
-            grab_ref_z_m = grab_ref_pos[2]
-            log(f"[INFO] {active_grab_hand} 固定抓取位姿: "
-                f"Z={grab_ref_z_m:.3f}m, quat="
-                f"[{grab_ref_quat[0]:.4f}, {grab_ref_quat[1]:.4f}, "
-                f"{grab_ref_quat[2]:.4f}, {grab_ref_quat[3]:.4f}]")
-            phase = "grab_upper_smt"
+            # 横向、前向必须是两个独立的闭环阶段；各自的次数预算在进入阶段的
+            # 第一帧锁定，避免检测误差变小时反而缩短可用的校正次数。
+            grab_align_stage = "lateral"
+            lateral_pass = 0
+            forward_pass = 0
+            lateral_max_pass = None
+            forward_max_pass = None
+            # grab_smt 的首帧再固定末端位姿，确保快照对应真正开始腕相机
+            # 闭环校正时的姿态，而非 upper_hand_ready 的过渡姿态。
+            grab_ref_quat = None
+            phase = "grab_smt"
+            continue
+
+        if phase == "lower_hand_ready":
+            assert(approach_plan and approach_basis is not None)
+
+            # 下蹲会破坏图形管线当前帧计算的视觉 world basis，不能在下蹲后
+            # 重新检测并重建 AABB。保存下蹲前 plan/basis 后，按已下发的
+            # 躯干位移将其转换到下蹲后的头相机坐标。
+            #
+            # 不用 HEAD→base_link TF 计算此位移：下蹲时 base_link 与头会
+            # 一起相对货架下降，二者的相对 TF 基本不变（日志中的约 0 mm
+            # 平移正是这个现象），无法表达相对固定货架的下蹲位移。
+            pre_squat_plan = approach_plan
+            pre_squat_basis = approach_basis.copy()
+            # 以实际加载的 scene3 料盘高度为准，而非架板高度：
+            # _scene_scene3_active.xml 中下层 smt_tray_1/2 为 z=0.75 m，
+            # 上层 smt_tray_3/4/5 为 z=1.15 m，抓取层差为 0.40 m。
+            # 原先采用架板的 0.60 m 会使下层 AABB 高出实际料盘约 200 mm。
+            squat_delta_m = -0.4
+            robot.squat(squat_delta_m)
+            rospy.sleep(2.0)
+
+            # 视觉世界 Z 轴向上。相机随机器人下移 0.40 m 后，静止料盘在
+            # 新相机坐标中上移 0.40 m；下蹲未转身，故沿用下蹲前 basis。
+            world_shift_mm = numpy.array(
+                [0.0, 0.0, -squat_delta_m * 1000.0], dtype=numpy.float32)
+            post_squat_basis = pre_squat_basis
+            transformed_trays = []
+            for tray in pre_squat_plan["trays"]:
+                transformed = dict(tray)
+                transformed["center_world_mm"] = (
+                    numpy.asarray(tray["center_world_mm"], dtype=numpy.float32) +
+                    world_shift_mm)
+                aabb = tray.get("aabb_world_mm")
+                if aabb is not None:
+                    transformed["aabb_world_mm"] = (
+                        numpy.asarray(aabb[0], dtype=numpy.float32) + world_shift_mm,
+                        numpy.asarray(aabb[1], dtype=numpy.float32) + world_shift_mm,
+                    )
+                transformed_trays.append(transformed)
+            approach_plan = {**pre_squat_plan, "trays": transformed_trays}
+            approach_basis = post_squat_basis
+            approach_plan_locked = True
+            wrist_filter = WristDetectionFilter(window=5)
+            log(f"[INFO] lower_hand_ready: 下蹲后 plan 平移 "
+                f"{world_shift_mm.tolist()} mm，使用下蹲前 AABB ROI")
+            phase = "lower_arm_ready"
+            # 下蹲的阻塞等待结束后先处理一次 GUI 事件，避免窗口无响应。
+            cv2.waitKey(1)
+            continue
+
+        if phase == "lower_arm_ready":
+            assert(approach_plan)
+
+            # 下层抓取必须使用计划中 layer=0 分配的手，不能复用上层手。
+            lower_hand = None
+            for tray in approach_plan["trays"]:
+                if tray["layer"] == 0:
+                    lower_hand = tray["hand"]   # "left" 或 "right"
+
+            if lower_hand is None:
+                log("[ERROR] lower_hand_ready: no lower layer tray in plan")
+                phase = "walk_to_shelf"
+                continue
+
+            active_grab_hand = lower_hand
+            # 此后头相机被手臂遮挡：冻结最后一次有效检测的 plan/AABB/basis。
+            approach_plan_locked = True
+
+            arm.switch_to_external_control()
+            rospy.sleep(3.0)
+
+            left_arm = [0, 0, 0, 0, -90, 0, 0]
+            right_arm = [0, 0, 0, 0, 90, 0, 0]
+
+            if lower_hand == "left":
+                left_arm = [30, 0, 0, 0, 0, 0, 0]
+            else:
+                right_arm = [30, 0, 0, 0, 0, 0, 0]
+            trace_lower_arm_command("1 shoulder", left_arm, right_arm)
+            rospy.sleep(2.0)
+            trace_lower_arm_feedback("1 shoulder")
+
+            if lower_hand == "left":
+                left_arm = [30, 0, 0, -150, 0, 0, 0]
+            else:
+                right_arm = [30, 0, 0, -150, 0, 0, 0]
+            trace_lower_arm_command("2 forearm", left_arm, right_arm)
+            rospy.sleep(6.0)
+            trace_lower_arm_feedback("2 forearm")
+
+            if lower_hand == "left":
+                left_arm = [0, 0, 0, -150, -90, 0, 0]
+            else:
+                right_arm = [0, 0, 0, -150, 90, 0, 0]
+            trace_lower_arm_command("3 shoulder-return", left_arm, right_arm)
+            rospy.sleep(3.0)
+            trace_lower_arm_feedback("3 shoulder-return")
+
+            if lower_hand == "left":
+                left_arm = [-5, 0, 0, -90, -85, -10, 0]
+            else:
+                right_arm = [-5, 0, 0, -90, 85, 10, 0]
+            trace_lower_arm_command("4 final", left_arm, right_arm)
+            rospy.sleep(4.0)
+            trace_lower_arm_feedback("4 final")
+
+            log(f"[INFO] lower_hand_ready: {lower_hand} arm ready for lower layer")
+            # 横向、前向必须是两个独立的闭环阶段；各自的次数预算在进入阶段的
+            # 第一帧锁定，避免检测误差变小时反而缩短可用的校正次数。
+            grab_align_stage = "lateral"
+            lateral_pass = 0
+            forward_pass = 0
+            lateral_max_pass = None
+            forward_max_pass = None
+            # grab_smt 的首帧再固定末端位姿，确保快照对应真正开始腕相机
+            # 闭环校正时的姿态，而非 lower_hand_ready 的过渡姿态。
+            grab_ref_quat = None
+            phase = "grab_smt"
             continue
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
-        
-        if phase == "grab_upper_smt":
+
+        if phase == "grab_smt":
+            # 仅在进入抓取闭环的首帧快照末端位姿。之后横向/前向校正始终
+            # 锁定同一四元数与绝对 Z，不能用每轮 FK 的下垂状态刷新基准。
+            if grab_ref_quat is None:
+                grab_ref_pose = arm.get_endpoint_pose(active_grab_hand)
+                if grab_ref_pose is None:
+                    log(f"[ERROR] {active_grab_hand} 无法快照抓取参考位姿，停止任务")
+                    robot.stop()
+                    return
+                grab_ref_pos, grab_ref_quat = grab_ref_pose
+                grab_ref_z_m = grab_ref_pos[2]
+                log(f"[INFO] {active_grab_hand} 固定抓取位姿: "
+                    f"Z={grab_ref_z_m:.3f}m, quat="
+                    f"[{grab_ref_quat[0]:.4f}, {grab_ref_quat[1]:.4f}, "
+                    f"{grab_ref_quat[2]:.4f}, {grab_ref_quat[3]:.4f}]")
+                continue
+
             # 只校正当前抬起、准备抓取上层料盘的手，避免带动另一只手。
             detection = wrist_filter.get(active_grab_hand)
             if detection is None:
@@ -1224,68 +1504,181 @@ def run_scene3(robot, arm, claw, head, log):
                     forwardOk = abs(forwardErrorMm) <= WRIST_DEPTH_TOLERANCE_MM
 
                     # 高度锁定：不使用腕相机 Y 直接移动，由 target_z_m 强制锁定预备姿态的 Z。
-                    if lateralOk and forwardOk:
-                        log(f"[INFO] {active_grab_hand} wrist: 校正完成，开始夹取")
-                        rospy.sleep(1.0)
-                        phase = "close_upper_smt"
-                    elif grab_pass < MAX_GRAB_PASSES:
+                    if grab_align_stage == "lateral":
+                        if lateral_max_pass is None:
+                            lateral_extra = min(
+                                1, max(math.floor((abs(lateralOffsetMm) - 20.0) / 20.0), 0))
+                            lateral_max_pass = MAX_GRAB_PASSES + lateral_extra
+                            log(f"[INFO] {active_grab_hand} wrist: 进入横向阶段，"
+                                f"预算={lateral_max_pass}次 "
+                                f"(基础{MAX_GRAB_PASSES}+偏移{lateral_extra})")
+                        # 达标或横向预算耗尽都必须进入前向阶段；预算耗尽只记录警告。
+                        if lateralOk or lateral_pass >= lateral_max_pass:
+                            if not lateralOk:
+                                log(f"[WARN] {active_grab_hand} wrist: 横向阶段耗尽 "
+                                    f"{lateral_pass}/{lateral_max_pass} 次，"
+                                    f"剩余 X={lateralOffsetMm:.1f}mm；继续前向阶段")
+                            else:
+                                log(f"[INFO] {active_grab_hand} wrist: 横向校正完成；"
+                                    "进入前向阶段")
+                            grab_align_stage = "forward"
+                            forward_max_pass = None
+                            continue
+                        # 视觉 X 误差不能整段一次走完：相机检测、机械回差和
+                        # 图像-机械臂标定误差都会造成超调，使用半增益闭环，
+                        # 剩余误差由后续横向轮次收敛。
                         correction_camera = [
-                            lateralOffsetMm if not lateralOk else 0.0,
-                            0.0,
-                            forwardErrorMm if not forwardOk else 0.0,
-                        ]
-                        # 本抓取策略要求“横向”严格为机器人左右、“前向”严格为
-                        # 机器人前后，不能用腕相机姿态旋转 correction_camera：手腕
-                        # 有 yaw/pitch 时，camera X/Z 会分别混入 base X/Y 分量。
-                        # optical X+ = 图像右；base_link Y+ = 机器人左。
-                        deltaBaseM = numpy.asarray([
-                            correction_camera[2] * 0.001,   # camera 前方 → base X+
-                            -correction_camera[0] * 0.001,  # camera 右方 → base Y-
-                            0.0,                             # 高度由 target_z_m 锁定
-                        ], dtype=numpy.float32)
-                        deltaNorm = float(numpy.linalg.norm(deltaBaseM))
-                        if deltaNorm > WRIST_ALIGN_MAX_STEP_M:
-                            deltaBaseM *= WRIST_ALIGN_MAX_STEP_M / deltaNorm
-                        grab_pass += 1
-                        tag = "前伸+横向" if not forwardOk else "横向"
-                        log(f"[INFO] {active_grab_hand} wrist: {tag}校正 "
-                            f"第{grab_pass}/{MAX_GRAB_PASSES}次 "
-                            f"X={lateralOffsetMm:.1f} Y观测={verticalOffsetMm:.1f} "
-                            f"Z={forwardErrorMm:.1f} mm, 锁高={grab_ref_z_m:.3f}m "
-                            f"→ base Δ={deltaBaseM.tolist()} m")
-                        arm.move_relative_cartesian(active_grab_hand, deltaBaseM.tolist(),
-                                                    step_m=0.003, settle_s=0.3,
-                                                    max_error_m=0.03,
-                                                    quat_xyzw=grab_ref_quat,
-                                                    target_z_m=grab_ref_z_m)
-                    else:
-                        log(f"[INFO] {active_grab_hand} wrist: 已达最大"
-                            f"{MAX_GRAB_PASSES}次校正，"
-                            f"剩余 X={lateralOffsetMm:.1f} Y观测={verticalOffsetMm:.1f} "
-                            f"Z={forwardErrorMm:.1f} mm（高度锁定）")
-                        phase = "close_upper_smt"
-        if phase == "close_upper_smt":
+                            lateralOffsetMm * WRIST_LATERAL_GAIN, 0.0, 0.0]
+                        lateral_pass += 1
+                        stage_name = "横向"
+                        stage_pass = lateral_pass
+                        stage_max_pass = lateral_max_pass
+                    else:  # forward
+                        if forward_max_pass is None:
+                            # 每轮至多前伸 WRIST_ALIGN_MAX_STEP_M。按首帧误差
+                            # 计算达到深度容差所需轮数；不能把远距离误差硬截成
+                            # 只额外 1 次，否则预算耗尽时仍会离料盘很远。
+                            max_forward_step_mm = WRIST_ALIGN_MAX_STEP_M * 1000.0
+                            required_forward_passes = int(math.ceil(
+                                max(abs(forwardErrorMm) - WRIST_DEPTH_TOLERANCE_MM, 0.0)
+                                / max_forward_step_mm))
+                            forward_extra = max(
+                                required_forward_passes - MAX_GRAB_PASSES, 0)
+                            forward_max_pass = MAX_GRAB_PASSES + forward_extra
+                            log(f"[INFO] {active_grab_hand} wrist: 进入前向阶段，"
+                                f"预算={forward_max_pass}次 "
+                                f"(基础{MAX_GRAB_PASSES}+额外{forward_extra}，"
+                                f"首帧误差={forwardErrorMm:.1f}mm，"
+                                f"单次上限={max_forward_step_mm:.0f}mm)")
+                        if forwardOk or forward_pass >= forward_max_pass:
+                            if not forwardOk:
+                                log(f"[WARN] {active_grab_hand} wrist: 前向阶段耗尽 "
+                                    f"{forward_pass}/{forward_max_pass} 次，"
+                                    f"剩余 Z={forwardErrorMm:.1f}mm；仍继续夹取")
+                            else:
+                                log(f"[INFO] {active_grab_hand} wrist: 前向校正完成，开始夹取")
+                            phase = "close_and_lift"
+                            continue
+                        correction_camera = [0.0, 0.0, forwardErrorMm]
+                        forward_pass += 1
+                        stage_name = "前向"
+                        stage_pass = forward_pass
+                        stage_max_pass = forward_max_pass
+
+                    # 本抓取策略要求“横向”严格为机器人左右、“前向”严格为
+                    # 机器人前后。不能让手腕 yaw/pitch 将相机 X/Z 混入另一轴。
+                    # optical X+ = 图像右；base_link Y+ = 机器人左。
+                    deltaBaseM = numpy.asarray([
+                        correction_camera[2] * 0.001,   # camera 前方 → base X+
+                        -correction_camera[0] * 0.001,  # camera 右方 → base Y-
+                        0.0,                             # 高度由 target_z_m 锁定
+                    ], dtype=numpy.float32)
+                    deltaNorm = float(numpy.linalg.norm(deltaBaseM))
+                    if grab_align_stage == "forward" and deltaNorm > WRIST_ALIGN_MAX_STEP_M:
+                        deltaBaseM *= WRIST_ALIGN_MAX_STEP_M / deltaNorm
+                    log(f"[INFO] {active_grab_hand} wrist: {stage_name}校正 "
+                        f"第{stage_pass}/{stage_max_pass}次 "
+                        f"X={lateralOffsetMm:.1f} Y观测={verticalOffsetMm:.1f} "
+                        f"Z={forwardErrorMm:.1f} mm, 锁高={grab_ref_z_m:.3f}m "
+                        f"→ base Δ={deltaBaseM.tolist()} m")
+                    moveOk = arm.move_relative_cartesian(
+                        active_grab_hand, deltaBaseM.tolist(),
+                        step_m=0.003, settle_s=0.3, max_error_m=0.03,
+                        quat_xyzw=grab_ref_quat, target_z_m=grab_ref_z_m)
+                    # 该调用会阻塞数秒；缓冲区中的所有样本均来自移动前，
+                    # 不能让下一轮横向闭环再按旧误差重复移动。
+                    wrist_filter.clear(active_grab_hand)
+                    if not moveOk:
+                        log(f"[WARN] {active_grab_hand} wrist: {stage_name}校正执行失败；"
+                            "已清空移动前观测，等待新检测")
+
+        if phase == "close_and_lift":
             (claw.left_close() if active_grab_hand == "left" else claw.right_close())
             claw.wait_until_done(timeout=3.0)
             rospy.sleep(3.0)
             log(f"[INFO] {active_grab_hand} claw: 已闭合，开始上提")
-            phase = "lift_upper_smt"
 
-        if phase == "lift_upper_smt":
+            # close_and_lift 表示夹取动作已经完成；夹爪状态反馈不可靠，
+            # 不读取 is_grabbed，直接将当前槽位标记为已取走并补虚拟料盘。
+            # 否则上 2 / 下 2 的对称构型会丢失原配对并在等价解间跳变。
+            picked_slot = next((
+                tray.get("slot_index")
+                for tray in approach_plan["trays"]
+                if tray["layer"] == current_grab_layer
+                and tray["hand"] == active_grab_hand
+                and not tray.get("virtual", False)
+            ), None)
+            if picked_slot is None:
+                log(f"[ERROR] {active_grab_hand} 找不到已抓取料盘的槽位")
+                robot.stop()
+                return
+            picked_tray_slots[current_grab_layer].add(picked_slot)
+            log(f"[INFO] 已取走 layer={current_grab_layer}, "
+                f"slot={picked_slot}；后续规划保留该虚拟槽位")
+
             left_arm  = [0, 0, 0, 0, 0, 0, 0]
             right_arm = [0, 0, 0, 0, 0, 0, 0]
             if active_grab_hand == "left":
-                left_arm = [0, 0, 0, -150, -90, 0, 0]
+                left_arm = [20, 0, 0, -150, -90, -40, 0]
             else:
-                right_arm = [0, 0, 0, -150, 90, 0, 0]
+                right_arm = [20, 0, 0, -150, 90, 40, 0]
             arm.go_to_joints(left_arm + right_arm)
             rospy.sleep(2.0)
             log(f"[INFO] {active_grab_hand} arm: 已上提")
-            phase = "upper_smt_lifted"
+
+            if current_grab_layer == 1:
+                phase = "back_for_lower"
+            else:
+                phase = "back_home"
+
+        if phase == "back_for_lower":
+            # 后退不用太高精度，现在还是致盲状态。
+            robot.move_backward(0.3, 1 / 0.3)  # 后退 1 m
+
+            # 抓住上层料盘后的姿态是 forearm_pitch=-150°。原先一次命令到 0°
+            # 会造成末端突然下落，料盘会因惯性被甩出。保持手腕 yaw 不变，
+            # 仅以 15° 一段逐步回收肘关节；每段都等待料盘摆动衰减后再继续。
+            wrist_yaw = -90 if active_grab_hand == "left" else 90
+            forearm_steps = (-135, -120, -105, -90, -75,
+                             -60, -45, -30, -15, 0)
+            for step_index, forearm_pitch in enumerate(forearm_steps, start=1):
+                left_arm = [0, 0, 0, 0, 0, 0, 0]
+                right_arm = [0, 0, 0, 0, 0, 0, 0]
+                held_arm = [0, 0, 0, forearm_pitch, wrist_yaw, 0, 0]
+                if active_grab_hand == "left":
+                    left_arm = held_arm
+                else:
+                    right_arm = held_arm
+
+                arm.go_to_joints(left_arm + right_arm)
+                log(f"[INFO] back_for_lower: {active_grab_hand} arm "
+                    f"lowering segment {step_index}/{len(forearm_steps)}, "
+                    f"forearm_pitch={forearm_pitch}°")
+                rospy.sleep(1.2)
+
+            selfRadius = 175
+            current_grab_layer = 0
+            # 视觉 world 的原点是头相机。后退后继续沿用上一轮冻结的
+            # plan/basis，会把红点固定在旧画面坐标，而不是当前料盘位置。
+            # 解锁并清空快照，下一帧检测到货架时会重建第二次 side_shift
+            # 使用的 approach_plan。
+            approach_plan = None
+            approach_basis = None
+            approach_plan_locked = False
+            wrist_filter = WristDetectionFilter(window=5)
+            phase = "side_shift"
+        
+        if phase == "back_home":
+            robot.stop()
+            robot.move_backward(0.3, 2 / 0.3)  # 后退 1 m
+            phase = "turn_back_table"
+        
+        if phase == "turn_back_table":
+            pass
 
         rate.sleep()
     # cv2.destroyWindow("depth")
-      
+
     # -------------------------------------------
 
     log("场景三：任务结束")
