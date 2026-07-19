@@ -10,6 +10,7 @@ except ImportError:
     cv2 = None
 
 from perception_api import CameraReader, SensorReader, TFReader
+from robot_api import WaistController
 from sensor_msgs.msg import CameraInfo
 
 HEAD_CAMERA_FRAME = "Head Camera View"
@@ -52,6 +53,26 @@ def quatToRotMatrix(quat):
         [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
         [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
     ], dtype=numpy.float32)
+
+def visualWorld2base(pointWorldMm, worldBasis, tfReader, timeout=1.0):
+    """视觉世界系位置点（mm）转换为 base_link 位置点（m）。"""
+    pointWorldMm = numpy.asarray(pointWorldMm, dtype=numpy.float32)
+    if pointWorldMm.shape != (3,):
+        raise ValueError(f"pointWorldMm 必须为 shape (3,)，收到 {pointWorldMm.shape}")
+
+    # worldPos = headCameraPos @ basis；位置点须先回到头相机光学系，
+    # 再加上头相机在 base_link 中的平移，不能复用仅变换位移的函数。
+    pointHeadMm = pointWorldMm @ numpy.asarray(worldBasis, dtype=numpy.float32).T
+    headPos, headQuat = tfReader.lookup("base_link", HEAD_CAMERA_FRAME, timeout=timeout)
+    if headPos is None or headQuat is None:
+        return None
+    try:
+        rotationHeadToBase = quatToRotMatrix(headQuat)
+    except ValueError:
+        return None
+    return (rotationHeadToBase @ (pointHeadMm / 1000.0)
+            + numpy.asarray(headPos, dtype=numpy.float32))
+
 
 def visualWorldVectorToBase(vectorWorldMm, worldBasis, tfReader, timeout=1.0):
     """将视觉世界系中的无原点位移向量（mm）变换为 base_link 位移（m）。"""
@@ -712,6 +733,7 @@ def run_scene3(robot, arm, claw, head, log):
     cam = CameraReader()
     sensor = SensorReader()
     tf = TFReader()
+    waist = WaistController()
 
     # /kuavo_arm_traj 的 14 个 position 是双臂的绝对目标。下层右手
     # 抓取出现关节异常时，需要同时记录“下发目标”和传感器实测，不能只看
@@ -749,6 +771,50 @@ def run_scene3(robot, arm, claw, head, log):
             f"{[round(v, 1) for v in actual[7:14]]}; "
             f"{arm_joint_names[8]}={actual[8]:.1f}°")
 
+    def log_waist_feedback(stage, target_yaw_deg):
+        """记录腰部命令已收敛后的实际关节反馈（v52 腰 yaw 位于 joint_q[12]）。"""
+        joint_q = sensor.get_joint_q()
+        if joint_q is None or len(joint_q) <= 12:
+            log(f"[WARN] {stage}: waist target={target_yaw_deg:.1f}°，"
+                "无法读取 joint_q[12] 反馈")
+            return
+        actual_yaw_deg = math.degrees(joint_q[12])
+        log(f"[INFO] {stage}: waist target={target_yaw_deg:.1f}°, "
+            f"actual={actual_yaw_deg:.1f}°, "
+            f"error={actual_yaw_deg - target_yaw_deg:+.1f}°")
+
+    def retry_place_ik(hand, stage):
+        """单手 IK 失败时向接收盒方位逐次转腰 10°；最多补偿 3 次。"""
+        retry = place_attempts.setdefault(hand, {
+            "failed_count": 0,
+            # 每只手均从 table_arm_ready 时冻结的腰部基准角重新开始，
+            # 不能继承上一只手失败后留下的 ±30°。
+            "base_yaw_deg": waist_align.get("delivery_base_yaw_deg", 0.0),
+        })
+        retry["failed_count"] += 1
+        failed_count = retry["failed_count"]
+        # 初始求解后允许 3 次腰部补偿（10°/20°/30°），因此第 4 次
+        # IK 仍失败时才放弃该手；不能在第 3 次补偿前提前退出。
+        if failed_count > 3:
+            log(f"[ERROR] {hand} {stage} 在 3 次腰部补偿后的第 4 次 IK "
+                "仍失败；当前位置直接松爪")
+            (claw.left_open() if hand == "left" else claw.right_open())
+            claw.wait_until_done(timeout=3.0)
+            return False
+
+        # base Y+ 为机器人左。接收盒在左侧时每次继续加正 yaw，右侧则
+        # 继续减负 yaw；第 1/2/3 次重试为相对基准腰角的 10°/20°/30°。
+        box_direction = 1.0 if place_hover_base_m[1] >= 0 else -1.0
+        waist.enable_external_control()
+        target_yaw_deg = waist.set_yaw(
+            retry["base_yaw_deg"] + box_direction * 10.0 * failed_count)
+        waist_align["target_yaw_deg"] = target_yaw_deg
+        log(f"[INFO] {hand} {stage} IK 失败；第 {failed_count}/3 次"
+            f"腰部补偿 → waist={target_yaw_deg:.1f}° 后进行下一次 IK")
+        rospy.sleep(1.5)
+        log_waist_feedback(f"{hand} {stage} retry {failed_count}", target_yaw_deg)
+        return True
+
     headFX = headCamInfo.K[0]
     headFY = headCamInfo.K[4]
     headCX = headCamInfo.K[2]
@@ -778,8 +844,13 @@ def run_scene3(robot, arm, claw, head, log):
     picked_tray_slots = {0: set(), 1: set()}
     # 首帧从等价候选中选定一次上下层槽位配对；任务结束前不再重选。
     approach_pair_slots = None
+    # 临时快速投放测试：跳过货架前的识别、靠近、抓取，初始朝向直接转向
+    # 身后的桌子并执行后续对齐/投放状态机。
+    # 回退正常任务逻辑：将下一行恢复为 phase = "walk_to_shelf"。
+    #phase = "turn_back_table"
     phase = "walk_to_shelf"
-    initial_tangent = None
+    # turn_back_table 的所有瞬时状态集中在一个字典内，避免散落的状态变量。
+    turn = {}
     # 料盘 AABB 与 basis 必须成对缓存。抬臂后头相机被 selfRadius 遮挡，
     # 腕相机的目标框仍应基于这份最后有效的检测快照来投影。
     approach_plan = None
@@ -797,6 +868,20 @@ def run_scene3(robot, arm, claw, head, log):
     MAX_GRAB_PASSES = 2
 
     current_grab_layer = 1
+
+    # 桌面投放状态：所有世界系坐标均在双臂遮挡头相机之前缓存。
+    place_queue = []
+    place_index = 0
+    place_hand = None
+    place_hover_base_m = None
+    place_release_base_m = None
+    place_quat = None
+    PLACE_HOVER_MM = 180.0
+    PLACE_RELEASE_CLEARANCE_MM = 40.0
+    # table_waist_align 的瞬时控制状态；腰部动作后必须重新感知桌子。
+    waist_align = {}
+    # 每只手的投放 IK 重试状态；初始求解加三次同向腰部补偿共最多 4 次。
+    place_attempts = {}
 
     while not rospy.is_shutdown():
         objectBoundingBoxCorners = []
@@ -887,7 +972,7 @@ def run_scene3(robot, arm, claw, head, log):
         # cv2.imshow("normalDotHori", normalHoriMask)
         # cv2.imshow("normalDotVert", normalVertMask)
         bgr = bgr.astype(numpy.float32)
-        turnThreshold = 0.2
+        turnThreshold = 0.5
 
         ROI = validMask.copy()
         backFurthest = maskedFuzzyMax(worldPos, validMask, 0, epsilon=200)
@@ -1302,9 +1387,9 @@ def run_scene3(robot, arm, claw, head, log):
             rospy.sleep(2.0)
 
             if upper_joints == "left":
-                left_arm = [30, 0, 0, -150, -90, 0, 0]
+                left_arm = [50, 0, 0, -150, -90, 0, 0]
             else:
-                right_arm = [30, 0, 0, -150, 90, 0, 0]
+                right_arm = [50, 0, 0, -150, 90, 0, 0]
             arm.go_to_joints(left_arm + right_arm)
             rospy.sleep(6.0)
 
@@ -1479,7 +1564,11 @@ def run_scene3(robot, arm, claw, head, log):
             # 只校正当前抬起、准备抓取上层料盘的手，避免带动另一只手。
             detection = wrist_filter.get(active_grab_hand)
             if detection is None:
-                log(f"[INFO] {active_grab_hand} wrist: AABB ROI 内未检测到料盘")
+                # 腕相机未在 ROI 内看到料盘时不能无限等待；当前手臂已按
+                # 货架视觉规划到抓取位，直接闭爪尝试抓取并推进任务。
+                log(f"[WARN] {active_grab_hand} wrist: AABB ROI 内未检测到料盘，"
+                    "跳过腕部校正，直接闭爪")
+                phase = "close_and_lift"
             else:
                 offset = detection["offset_camera_mm"]
                 pixelOffset = detection["pixel_offset"]
@@ -1616,8 +1705,8 @@ def run_scene3(robot, arm, claw, head, log):
             log(f"[INFO] 已取走 layer={current_grab_layer}, "
                 f"slot={picked_slot}；后续规划保留该虚拟槽位")
 
-            left_arm  = [0, 0, 0, 0, 0, 0, 0]
-            right_arm = [0, 0, 0, 0, 0, 0, 0]
+            left_arm  = [0, 0, 0, 0, -90, 0, 0]
+            right_arm = [0, 0, 0, 0, 90, 0, 0]
             if active_grab_hand == "left":
                 left_arm = [20, 0, 0, -150, -90, -40, 0]
             else:
@@ -1642,8 +1731,8 @@ def run_scene3(robot, arm, claw, head, log):
             forearm_steps = (-135, -120, -105, -90, -75,
                              -60, -45, -30, -15, 0)
             for step_index, forearm_pitch in enumerate(forearm_steps, start=1):
-                left_arm = [0, 0, 0, 0, 0, 0, 0]
-                right_arm = [0, 0, 0, 0, 0, 0, 0]
+                left_arm = [0, 0, 0, 0, -90, 0, 0]
+                right_arm = [0, 0, 0, 0, 90, 0, 0]
                 held_arm = [0, 0, 0, forearm_pitch, wrist_yaw, 0, 0]
                 if active_grab_hand == "left":
                     left_arm = held_arm
@@ -1671,14 +1760,415 @@ def run_scene3(robot, arm, claw, head, log):
         if phase == "back_home":
             robot.stop()
             robot.move_backward(0.3, 2 / 0.3)  # 后退 1 m
+
+            # 下层料盘抓取后，active_grab_hand 仍处于抬起、肘部折叠的
+            # 姿态。若直接转向，手臂会遮住头相机，桌子无法被 boxClass==2
+            # 检出。仿照 back_for_lower，将本次下层抓取所用的手逐段放下，
+            # 并在完全收回后才开始 180° 转身。
+            wrist_yaw = -90 if active_grab_hand == "left" else 90
+            forearm_steps = (-135, -120, -105, -90, -75,
+                             -60, -45, -30, -15, 0)
+            for step_index, forearm_pitch in enumerate(forearm_steps, start=1):
+                left_arm = [0, 0, 0, 0, -90, 0, 0]
+                right_arm = [0, 0, 0, 0, 90, 0, 0]
+                held_arm = [0, 0, 0, forearm_pitch, wrist_yaw, 0, 0]
+                if active_grab_hand == "left":
+                    left_arm = held_arm
+                else:
+                    right_arm = held_arm
+                arm.go_to_joints(left_arm + right_arm)
+                log(f"[INFO] back_home: {active_grab_hand} arm "
+                    f"lowering segment {step_index}/{len(forearm_steps)}, "
+                    f"forearm_pitch={forearm_pitch}°")
+                rospy.sleep(1.2)
+
+            # 每次进入转身阶段均重新取样，不能复用上一次世界系的墙面方向。
+            turn.clear()
+            log(f"[INFO] back_home: {active_grab_hand} arm 已放下，开始转向桌子")
             phase = "turn_back_table"
-        
+
         if phase == "turn_back_table":
-            pass
+            # groundTangent 是视觉世界系的 X 轴：它由墙面法线及地面法线
+            # 构造，并通过与上一帧候选轴的最大点积保持方向连续。机器人转
+            # 过 180° 后，同一面墙在相机坐标中的方向相反，因此点积约为 -1。
+            now = sensor.get_sim_time()
+            if not turn:
+                turn.update(initial_tangent=groundTangent.copy(), started_at=now,
+                            sweep_at=now, direction=1, mode="scan", settle_at=None)
+                log("[INFO] turn_back_table: 已记录初始墙面方向，开始左右扫描")
+
+            cos_angle = float(numpy.dot(turn["initial_tangent"], groundTangent))
+            elapsed = now - turn["started_at"]
+            if turn["mode"] == "scan":
+                if cos_angle < -0.99:
+                    # 先刹停并等待惯量完全消失；不能以转动过程中的视觉帧
+                    # 直接判定完成，否则停车后可能已经偏离目标角度。
+                    robot.stop()
+                    turn.update(mode="settling", settle_at=sensor.get_sim_time())
+                    log(f"[INFO] turn_back_table: 首次命中 dot={cos_angle:.3f}，"
+                        "停车等待稳定后复核")
+                else:
+                    # 单次扫描覆盖超过 180° 的角度；未检测到反向墙面法线时反向。
+                    if now - turn["sweep_at"] >= 8.0:
+                        turn["direction"] *= -1
+                        turn["sweep_at"] = now
+                        direction_name = "left" if turn["direction"] > 0 else "right"
+                        log(f"[INFO] turn_back_table: dot={cos_angle:.3f}，"
+                            f"切换向 {direction_name} 扫描")
+                    if turn["direction"] > 0:
+                        robot.turn_left(0.5)
+                    else:
+                        robot.turn_right(0.5)
+            elif turn["mode"] == "correcting":
+                # 连续重发 Twist；不传 duration，避免短脉冲不足以克服步态死区。
+                if cos_angle < -0.99:
+                    robot.stop()
+                    turn.update(mode="settling", settle_at=sensor.get_sim_time())
+                    log(f"[INFO] turn_back_table: 补偿命中 dot={cos_angle:.3f}，"
+                        "停车等待稳定后复核")
+                else:
+                    # dot/cos 无法区分目标前后的左右偏差。相对初始墙面方向
+                    # 绕地面法线的有符号正弦给出 cos 的转向梯度：sin<0 左转，
+                    # sin>0 右转，都会使 dot 向 -1 收敛。
+                    signed_sin = float(numpy.dot(
+                        groundNormal,
+                        numpy.cross(turn["initial_tangent"], groundTangent)))
+                    correction_direction = 1 if signed_sin < 0 else -1
+                    if correction_direction > 0:
+                        robot.turn_left(0.2)
+                    else:
+                        robot.turn_right(0.2)
+            else:  # settling：底盘已停车，复核后决定是否进入连续补偿
+                if now - turn["settle_at"] >= 0.7:
+                    if cos_angle < -0.99:
+                        log(f"[INFO] turn_back_table 完成: 停稳后 dot={cos_angle:.3f}, "
+                            f"耗时={elapsed:.1f}s")
+                        phase = "walk_to_table"
+                    else:
+                        signed_sin = float(numpy.dot(
+                            groundNormal,
+                            numpy.cross(turn["initial_tangent"], groundTangent)))
+                        correction_direction = 1 if signed_sin < 0 else -1
+                        direction_name = ("left" if correction_direction > 0
+                                          else "right")
+                        turn["mode"] = "correcting"
+                        log(f"[INFO] turn_back_table: 停稳 dot={cos_angle:.3f}, "
+                            f"sin={signed_sin:.3f}，开始连续向 {direction_name} 补偿")
+                        if correction_direction > 0:
+                            robot.turn_left(0.2)
+                        else:
+                            robot.turn_right(0.2)
+
+        if phase == "walk_to_table":
+            if boxClass != 2:
+                # 转身后若离桌子/接收盒过近，AABB 不完整会导致 table 分类失败。
+                # 持续小步后退扩大头相机视野，直到能够稳定识别到桌子。
+                robot.move_backward(0.05)
+                log("[INFO] walk_to_table: waiting for table detection; backing up")
+            else:
+                # groundTangent 的符号并不固定，不能假定 boxFPos 一定是近端。
+                # 世界系原点为头相机，取两端面中绝对值较小者才是桌子的近端面。
+                near_face_dist = min(abs(boxFPos), abs(boxBPos))
+                target_dist = 500.0  # mm，距桌子近端面的安全站位
+                if near_face_dist > target_dist:
+                    robot.move_forward(0.1)
+                else:
+                    robot.stop()
+                    log(f"[INFO] walk_to_table 完成: "
+                        f"near={near_face_dist:.0f}mm")
+                    phase = "table_side_shift"
+
+        if phase == "table_side_shift":
+            if boxClass != 2:
+                # 横向对齐前桌子未完整入镜时，后退扩大深度视野；原地停车
+                # 会一直保持同一张无法分类的画面。
+                robot.move_backward(0.05)
+                log("[INFO] table_side_shift: waiting for table detection; backing up")
+            else:
+                # objectBoundingBoxCorners[1] 是桌面上方 targetMask 的整体
+                # 物体 AABB；用它的 Y 中点对齐机器人中心（world Y=0），
+                # 不再使用桌子整体的 boxLPos/boxRPos。
+                object_aabb = objectBoundingBoxCorners[1]
+                object_center_y = (object_aabb[0][1] + object_aabb[1][1]) / 2.0
+
+                # world Y 的正负由 groundTangent 的符号决定；转身后不能把
+                # object_center_y 的正负直接当作机器人左右。先将该世界系
+                # 横向误差变换到 base_link，按 base Y+（机器人左）选方向。
+                # 要让物体从机器人横向中心移到 0，底盘应沿“物体所在侧”移动。
+                object_offset_base = visualWorldVectorToBase(
+                    [0.0, object_center_y, 0.0], basis, tf, timeout=1.0)
+                if object_offset_base is None:
+                    robot.stop()
+                    log("[WARN] table_side_shift: 无法将 world Y 误差变换到 base_link")
+                    rate.sleep()
+                    continue
+
+                base_lateral_m = float(object_offset_base[1])
+                base_lateral_mm = base_lateral_m * 1000.0
+                log(f"[INFO] table_side_shift: object_center_y(world)="
+                    f"{object_center_y:.0f}mm → base_y={base_lateral_mm:.0f}mm")
+                if abs(base_lateral_mm) > 10:
+                    speed = 0.05
+                elif abs(base_lateral_mm) > 5:
+                    speed = 0.03
+                else:
+                    robot.stop()
+                    log("[INFO] table_side_shift 完成: 机器人中心已对齐桌上物体中心")
+                    phase = "table_pre_approach_arm_ready"
+                    rate.sleep()
+                    continue
+
+                if base_lateral_m > 0:
+                    robot.move_left(speed)   # base Y+ = 机器人左
+                    direction = "left"
+                else:
+                    robot.move_right(speed)  # base Y- = 机器人右
+                    direction = "right"
+                log(f"[INFO] table_side_shift: move_{direction}({speed:.2f}), "
+                    f"目标横向误差={base_lateral_mm:.0f}mm")
+
+        if phase == "table_pre_approach_arm_ready":
+            # 在桌前精接近前先抬肩、折肘；这样接近结束后只需完成后续
+            # table_arm_ready 姿态即可进入投放，避免在盒边一次性大幅摆臂。
+            arm.switch_to_external_control()
+            arm.go_to_joints([
+                40, 0, 0, 0, 0, 0, 0,
+                40, 0, 0, 0, 0, 0, 0,
+            ])
+            rospy.sleep(2.0)
+            arm.go_to_joints([
+                40, 0, 0, -100, -90, 0, 0,
+                40, 0, 0, -100, 90, 0, 0,
+            ])
+            rospy.sleep(6.0)
+            log("[INFO] table_pre_approach_arm_ready: 双臂已完成肩部/前臂预备")
+            phase = "table_post_side_shift"
+
+        if phase == "table_post_side_shift":
+            # 仿照货架前 post_side_shift：横向对齐后再以低速精确靠近。
+            if boxClass != 2:
+                # 双臂预备后若桌子框不完整，后退扩大头相机视野，不能原地等待。
+                robot.move_backward(0.05)
+                log("[INFO] table_post_side_shift: waiting for table detection; backing up")
+            else:
+                target_dist = 200.0  # mm，桌子近端面到头相机的目标距离
+                tolerance = 15.0
+                near_face_dist = min(abs(boxFPos), abs(boxBPos))
+                error = near_face_dist - target_dist
+                log(f"[INFO] table_post_side_shift: near={near_face_dist:.0f}mm, "
+                    f"error={error:.0f}mm")
+                if error > tolerance:
+                    robot.move_forward(0.05)
+                elif error < -tolerance:
+                    robot.move_backward(0.05)
+                else:
+                    robot.stop()
+                    waist_align.clear()
+                    phase = "table_waist_align"
+
+        if phase == "table_waist_align":
+            # 身体停稳后，以初始货架墙面方向为参考转腰补偿残余 yaw。
+            # 目标不是 base 的 180°，而是头部/双臂所在上半身的视觉方向
+            # 满足 dot(initial_tangent, groundTangent) < -0.99。
+            if not turn or boxClass != 2:
+                robot.stop()
+                log("[INFO] table_waist_align: waiting for turn/table observation")
+            else:
+                cos_angle = float(numpy.dot(
+                    turn["initial_tangent"], groundTangent))
+                now = sensor.get_sim_time()
+                if (waist_align.get("feedback_pending") and
+                        now - waist_align["commanded_at"] >= 1.0):
+                    log_waist_feedback("table_waist_align", waist_align["target_yaw_deg"])
+                    waist_align["feedback_pending"] = False
+                if cos_angle < -0.99:
+                    log(f"[INFO] table_waist_align 完成: dot={cos_angle:.3f}")
+                    phase = "table_arm_ready"
+                elif (not waist_align or
+                      now - waist_align["commanded_at"] >= 1.0):
+                    # signed_angle 是墙面方向在相机水平面中的有符号角。相机
+                    # 方向与腰部 yaw 反向变化，因此腰部补偿为 angle - target。
+                    signed_sin = float(numpy.dot(
+                        groundNormal,
+                        numpy.cross(turn["initial_tangent"], groundTangent)))
+                    signed_angle = math.atan2(signed_sin, cos_angle)
+                    target_angle = -math.pi if signed_angle < 0 else math.pi
+                    residual_yaw_deg = math.degrees(signed_angle - target_angle)
+                    previous_yaw_deg = waist_align.get("target_yaw_deg", 0.0)
+
+                    waist.enable_external_control()
+                    target_yaw_deg = waist.set_yaw(
+                        previous_yaw_deg + residual_yaw_deg)
+                    waist_align.update(target_yaw_deg=target_yaw_deg,
+                                       commanded_at=now, feedback_pending=True)
+                    log(f"[INFO] table_waist_align: dot={cos_angle:.3f}, "
+                        f"sin={signed_sin:.3f}, residual={residual_yaw_deg:.1f}°, "
+                        f"waist={target_yaw_deg:.1f}°")
+
+        if phase == "table_arm_ready":
+            # [2] 是桌上接收盒的内缩 AABB。缓存当前 world/basis，后续双臂
+            # 会遮挡头相机，不能再用新帧结果覆盖投放目标。
+            if boxClass != 2 or len(objectBoundingBoxCorners) < 3:
+                robot.stop()
+                log("[INFO] table_arm_ready: waiting for receiving box detection")
+            else:
+                receiver_aabb = objectBoundingBoxCorners[2]
+                receiver_min = numpy.asarray(receiver_aabb[0], dtype=numpy.float32)
+                receiver_max = numpy.asarray(receiver_aabb[1], dtype=numpy.float32)
+                release_world_mm = (receiver_min + receiver_max) / 2.0
+                # AABB [2] 的底面即盒沿顶部；在其上方松爪，料盘可在盒内叠放。
+                release_world_mm[2] = receiver_min[2] + PLACE_RELEASE_CLEARANCE_MM
+                hover_world_mm = release_world_mm + numpy.array(
+                    [0.0, 0.0, PLACE_HOVER_MM], dtype=numpy.float32)
+                place_release_base_m = visualWorld2base(
+                    release_world_mm, basis.copy(), tf)
+                place_hover_base_m = visualWorld2base(
+                    hover_world_mm, basis.copy(), tf)
+                if place_release_base_m is None or place_hover_base_m is None:
+                    waist.reset_and_release()
+                    robot.stop()
+                    log("[ERROR] table_arm_ready: world → base TF 变换失败，停止投放")
+                    return
+
+                # 不修改货架前逐手抓取逻辑；仅在桌前采用 *_arm_ready 的分段
+                # 抬臂思路，将两只持料盘的手带至高位、镜像投放预备姿态。
+                arm.switch_to_external_control()
+                # 前两段（肩部抬起、前臂折叠）已在
+                # table_pre_approach_arm_ready 中完成；此处只完成收肩与
+                # 最终投放预备，避免桌边重复大幅摆臂。
+                ready_stages = [
+                    ([0, 0, 0, -150, -90, 0, 0,
+                      0, 0, 0, -150, 90, 0, 0], 3.0),
+                    ([-20, 0, 0, -140, -90, -35, 0,
+                      -20, 0, 0, -140, 90, 35, 0], 4.0),
+                ]
+                for joints, settle_s in ready_stages:
+                    arm.go_to_joints(joints)
+                    rospy.sleep(settle_s)
+
+                # 上、下层料盘分别由左右手持有；IK 逐手执行，另一只手锁定。
+                # 冻结桌前对正后的腰部基准。每只手的 IK 重试都从该基准开始。
+                waist_align["delivery_base_yaw_deg"] = waist_align.get(
+                    "target_yaw_deg", 0.0)
+                place_queue = ["left", "right"]
+                place_attempts.clear()
+                place_index = 0
+                place_hand = None
+                place_quat = None
+                log("[INFO] table_arm_ready: 双臂投放预备完成，开始依次投放")
+                phase = "place_next_hand"
+
+        if phase == "place_next_hand":
+            if place_index >= len(place_queue):
+                waist.reset_and_release()
+                robot.stop()
+                log("[INFO] 场景三：双手投放流程结束，任务结束")
+                return
+
+            place_hand = place_queue[place_index]
+            if place_hand not in place_attempts:
+                # 上一只手可能为寻找 IK 解将腰转至极限；切换手时必须回到
+                # 同一桌前基准角，否则下一只手会从错误的 -30°/+30° 起算。
+                base_yaw_deg = waist_align.get("delivery_base_yaw_deg", 0.0)
+                current_target_yaw_deg = waist_align.get(
+                    "target_yaw_deg", base_yaw_deg)
+                if abs(current_target_yaw_deg - base_yaw_deg) > 0.1:
+                    waist.enable_external_control()
+                    target_yaw_deg = waist.set_yaw(base_yaw_deg)
+                    waist_align["target_yaw_deg"] = target_yaw_deg
+                    log(f"[INFO] place_next_hand/{place_hand}: 腰部回到投放基准 "
+                        f"{target_yaw_deg:.1f}°")
+                    rospy.sleep(1.5)
+                    log_waist_feedback(
+                        f"place_next_hand/{place_hand} baseline", target_yaw_deg)
+                place_attempts[place_hand] = {
+                    "failed_count": 0,
+                    "base_yaw_deg": base_yaw_deg,
+                }
+
+            endpoint_pose = arm.get_endpoint_pose(place_hand)
+            if endpoint_pose is None:
+                log(f"[WARN] {place_hand} 投放：无法读取预备姿态")
+                if retry_place_ik(place_hand, "hover pose"):
+                    phase = "place_next_hand"
+                else:
+                    place_index += 1
+                    place_hand = None
+                    phase = "place_next_hand"
+            else:
+                _, place_quat = endpoint_pose
+                # 使用不带 FK 残差拒绝门限的单臂 IK；另一只手仍由当前关节角锁定。
+                ok, joints = arm.solve_ik_one_hand(
+                    place_hand, place_hover_base_m.tolist(), place_quat,
+                    frame=2, constraint_mode=0x03)
+                if ok:
+                    # 记录完整 14 关节解，便于根据实机稳定性挑选并固化手动姿态。
+                    log(f"[TRACE] place_next_hand/{place_hand}: hover target="
+                        f"{place_hover_base_m.tolist()}, IK joints_deg="
+                        f"{[round(float(q), 3) for q in joints]}")
+                else:
+                    log(f"[WARN] place_next_hand/{place_hand}: hover IK 未返回关节解")
+                applied = ok and arm.apply_ik_single_arm_solution(place_hand, joints)
+                if not applied:
+                    if retry_place_ik(place_hand, "hover"):
+                        phase = "place_next_hand"
+                    else:
+                        place_index += 1
+                        place_hand = None
+                        phase = "place_next_hand"
+                else:
+                    rospy.sleep(3.0)
+                    log(f"[INFO] {place_hand} 投放：已到达盒子上方 hover 点")
+                    phase = "place_release_hand"
+
+        if phase == "place_release_hand":
+            ok, joints = arm.solve_ik_one_hand(
+                place_hand, place_release_base_m.tolist(), place_quat,
+                frame=2, constraint_mode=0x03)
+            applied = ok and arm.apply_ik_single_arm_solution(place_hand, joints)
+            if not applied:
+                # 未到达释放点绝不松爪；转腰后重新从 hover 开始求解。
+                if retry_place_ik(place_hand, "release"):
+                    phase = "place_next_hand"
+                else:
+                    place_index += 1
+                    place_hand = None
+                    phase = "place_next_hand"
+            else:
+                rospy.sleep(2.0)
+                (claw.left_open() if place_hand == "left" else claw.right_open())
+                if not claw.wait_until_done(timeout=3.0):
+                    log(f"[WARN] {place_hand} 投放：夹爪张开等待超时，继续后续流程")
+                log(f"[INFO] {place_hand} 投放：已下发松爪指令")
+                phase = "place_retract_hand"
+
+        if phase == "place_retract_hand":
+            # 释放后尽力抬回 hover；失败也继续处理另一只手。
+            ok, joints = arm.solve_ik_one_hand(
+                place_hand, place_hover_base_m.tolist(), place_quat,
+                frame=2, constraint_mode=0x03)
+            applied = ok and arm.apply_ik_single_arm_solution(place_hand, joints)
+            if not applied:
+                log(f"[WARN] {place_hand} 投放：撤回 IK 未执行，继续另一只手")
+            else:
+                rospy.sleep(2.0)
+
+            if place_hand == "left":
+                # 左手松爪后不能停在接收盒上方，否则右手的 IK 会把它作为
+                # 固定障碍一起锁住。回到 table_arm_ready 已验证的左侧高位，
+                # 让出盒子上方与右手的跨身轨迹。
+                arm.left_arm_to([-20, 0, 0, -140, -90, -35, 0])
+                rospy.sleep(3.0)
+                log("[INFO] left 投放：已回收到左侧让位姿态")
+            place_index += 1
+            place_hand = None
+            place_quat = None
+            phase = "place_next_hand"
 
         rate.sleep()
     # cv2.destroyWindow("depth")
 
     # -------------------------------------------
 
+    waist.reset_and_release()
     log("场景三：任务结束")

@@ -6,12 +6,14 @@
 不用关心 Twist、JointState 等消息格式。
 
 用法示例:
-    from robot_api import RobotMover, ArmController, ClawController, HeadController
+    from robot_api import (RobotMover, ArmController, ClawController,
+                           HeadController, WaistController)
 
     robot = RobotMover()
     arm = ArmController()
     claw = ClawController()
     head = HeadController()
+    waist = WaistController()
 
     robot.move_forward(0.2, duration=2.0)   # 前进 2 秒
     arm.switch_to_external_control()         # 切到外部控制模式
@@ -24,13 +26,13 @@ import math
 import time
 import rospy
 from geometry_msgs.msg import Twist
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 from sensor_msgs.msg import JointState
 from kuavo_msgs.srv import controlLejuClaw, changeArmCtrlMode, twoArmHandPoseCmdSrv, fkSrv
 from kuavo_msgs.msg import (lejuClawState, endEffectorData,
                             twoArmHandPoseCmd, twoArmHandPose,
                             armHandPose, ikSolveParam,
-                            robotHeadMotionData, sensorsData)
+                            robotHeadMotionData, robotWaistControl, sensorsData)
 
 
 # ============================================================
@@ -162,6 +164,62 @@ class RobotMover:
         for _ in range(repeat):
             self._pose_pub.publish(twist)
             rospy.sleep(interval)
+
+
+# ============================================================
+#  WaistController —— 腰部 yaw 控制
+# ============================================================
+class WaistController:
+    """控制单自由度腰部 yaw。
+
+    腰部控制器默认由 RL 接管。调用 :meth:`enable_external_control` 后，
+    再通过 :meth:`set_yaw` 发布目标角度；控制器端会将指令限幅到 ±30°。
+
+    用法::
+
+        waist = WaistController()
+        waist.enable_external_control()
+        waist.set_yaw(12.0)       # 单位：度，正负遵循腰关节自身约定
+        ...
+        waist.reset_and_release() # 回零并交回 RL
+    """
+
+    MIN_YAW_DEG = -30.0
+    MAX_YAW_DEG = 30.0
+
+    def __init__(self):
+        self._enable_pub = rospy.Publisher(
+            "/humanoid_controller/enable_waist_control", Bool, queue_size=1)
+        self._motion_pub = rospy.Publisher(
+            "/robot_waist_motion_data", robotWaistControl, queue_size=1)
+        self._enabled = False
+        self._last_yaw_deg = 0.0
+        rospy.sleep(0.1)
+
+    def enable_external_control(self):
+        """切换到外部腰部控制模式（mode 2）。"""
+        self._enable_pub.publish(Bool(data=True))
+        self._enabled = True
+
+    def disable_external_control(self):
+        """交回 RL 腰部控制模式（mode 1）。"""
+        self._enable_pub.publish(Bool(data=False))
+        self._enabled = False
+
+    def set_yaw(self, yaw_deg):
+        """发布腰部 yaw 目标，单位为度；返回实际发布的限幅后角度。"""
+        yaw_deg = max(self.MIN_YAW_DEG, min(self.MAX_YAW_DEG, float(yaw_deg)))
+        msg = robotWaistControl()
+        msg.header.stamp = rospy.Time.now()
+        msg.data.data = [yaw_deg]
+        self._motion_pub.publish(msg)
+        self._last_yaw_deg = yaw_deg
+        return yaw_deg
+
+    def reset_and_release(self):
+        """将腰部回零，然后交回 RL 控制。"""
+        self.set_yaw(0.0)
+        self.disable_external_control()
 
 
 # ============================================================
