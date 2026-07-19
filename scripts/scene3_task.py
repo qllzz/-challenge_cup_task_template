@@ -3,6 +3,7 @@
 import rospy
 import numpy
 import math
+from enum import Enum, auto
 
 try:
     import cv2
@@ -18,6 +19,29 @@ LEFT_WRIST_CAMERA_FRAME = "Left Wrist Camera View"
 RIGHT_WRIST_CAMERA_FRAME = "Right wrist Camera View"
 
 SHOULDER_WIDTH = 505.4 # mm
+
+
+class Scene3Phase(Enum):
+    WALK_TO_SHELF = auto()
+    SIDE_SHIFT = auto()
+    POST_SIDE_SHIFT = auto()
+    UPPER_HAND_READY = auto()
+    LOWER_HAND_READY = auto()
+    LOWER_ARM_READY = auto()
+    GRAB_SMT = auto()
+    CLOSE_AND_LIFT = auto()
+    BACK_FOR_LOWER = auto()
+    BACK_HOME = auto()
+    TURN_BACK_TABLE = auto()
+    WALK_TO_TABLE = auto()
+    TABLE_SIDE_SHIFT = auto()
+    TABLE_PRE_APPROACH_ARM_READY = auto()
+    TABLE_POST_SIDE_SHIFT = auto()
+    TABLE_WAIST_ALIGN = auto()
+    TABLE_ARM_READY = auto()
+    PLACE_NEXT_HAND = auto()
+    PLACE_RELEASE_HAND = auto()
+    PLACE_RETRACT_HAND = auto()
 
 def depthToPos(depth, fx, fy, cx, cy):
     h, w = depth.shape
@@ -846,9 +870,9 @@ def run_scene3(robot, arm, claw, head, log):
     approach_pair_slots = None
     # 临时快速投放测试：跳过货架前的识别、靠近、抓取，初始朝向直接转向
     # 身后的桌子并执行后续对齐/投放状态机。
-    # 回退正常任务逻辑：将下一行恢复为 phase = "walk_to_shelf"。
-    #phase = "turn_back_table"
-    phase = "walk_to_shelf"
+    # 回退正常任务逻辑：将下一行恢复为 Scene3Phase.WALK_TO_SHELF。
+    # phase = Scene3Phase.TURN_BACK_TABLE
+    phase = Scene3Phase.WALK_TO_SHELF
     # turn_back_table 的所有瞬时状态集中在一个字典内，避免散落的状态变量。
     turn = {}
     # 料盘 AABB 与 basis 必须成对缓存。抬臂后头相机被 selfRadius 遮挡，
@@ -1278,7 +1302,7 @@ def run_scene3(robot, arm, claw, head, log):
             cv2.imshow("rightWristImg", Rbgr / 255.0)
 
 
-        if phase == "walk_to_shelf":
+        if phase == Scene3Phase.WALK_TO_SHELF:
             if boxClass == 1:
                 print(boxBPos)
                 if abs(boxBPos) > 1000:
@@ -1287,12 +1311,12 @@ def run_scene3(robot, arm, claw, head, log):
                     robot.move_forward(0.05)
                 else:
                     robot.stop()
-                    phase = "side_shift"
+                    phase = Scene3Phase.SIDE_SHIFT
             else:
                 robot.stop()
                 log(f"[ERROR] {phase}: shelf not found")
 
-        if phase == "side_shift":
+        if phase == Scene3Phase.SIDE_SHIFT:
             # 第二次抓取刚解锁旧快照时，至少等一帧有效货架检测重建 plan；
             # 不使用旧的相机原点坐标，也不能因偶发漏检直接 assert 退出。
             if approach_plan is None:
@@ -1320,7 +1344,7 @@ def run_scene3(robot, arm, claw, head, log):
                     robot.move_right(0.03 * abs(off) / off)
                 elif boxClass == 1:
                     robot.stop()
-                    phase = "post_side_shift"
+                    phase = Scene3Phase.POST_SIDE_SHIFT
             elif upper_joints == "right":
                 off = upper_tray_y - SHOULDER_WIDTH/2
                 log(f"[INFO] {phase} off: {off}")
@@ -1330,13 +1354,13 @@ def run_scene3(robot, arm, claw, head, log):
                     robot.move_right(0.03 * abs(off) / off)
                 elif boxClass == 1:
                     robot.stop()
-                    phase = "post_side_shift"
+                    phase = Scene3Phase.POST_SIDE_SHIFT
             else:
                 log(f"[ERROR] {phase}: unexpected upper_joints={upper_joints}")
                 robot.stop()
 
 
-        if phase == "post_side_shift":
+        if phase == Scene3Phase.POST_SIDE_SHIFT:
             target_dist = 320  # mm，距货架的期望深度
             tolerance = 15     # mm，允许误差
             if boxClass == 1:
@@ -1350,11 +1374,11 @@ def run_scene3(robot, arm, claw, head, log):
                 else:
                     robot.stop()
                     if current_grab_layer == 1:
-                        phase = "upper_hand_ready"
+                        phase = Scene3Phase.UPPER_HAND_READY
                     elif current_grab_layer == 0:
-                        phase = "lower_hand_ready"
+                        phase = Scene3Phase.LOWER_HAND_READY
 
-        if phase == "upper_hand_ready":
+        if phase == Scene3Phase.UPPER_HAND_READY:
             assert(approach_plan)
 
             # 确定上下层各对应的手，上层抬、下层低位
@@ -1366,7 +1390,7 @@ def run_scene3(robot, arm, claw, head, log):
 
             if upper_joints is None:
                 log("[ERROR] upper_hand_ready: no upper layer tray in plan")
-                phase = "walk_to_shelf"
+                phase = Scene3Phase.WALK_TO_SHELF
                 continue
 
             active_grab_hand = upper_joints
@@ -1418,10 +1442,10 @@ def run_scene3(robot, arm, claw, head, log):
             # grab_smt 的首帧再固定末端位姿，确保快照对应真正开始腕相机
             # 闭环校正时的姿态，而非 upper_hand_ready 的过渡姿态。
             grab_ref_quat = None
-            phase = "grab_smt"
+            phase = Scene3Phase.GRAB_SMT
             continue
 
-        if phase == "lower_hand_ready":
+        if phase == Scene3Phase.LOWER_HAND_READY:
             assert(approach_plan and approach_basis is not None)
 
             # 下蹲会破坏图形管线当前帧计算的视觉 world basis，不能在下蹲后
@@ -1465,12 +1489,12 @@ def run_scene3(robot, arm, claw, head, log):
             wrist_filter = WristDetectionFilter(window=5)
             log(f"[INFO] lower_hand_ready: 下蹲后 plan 平移 "
                 f"{world_shift_mm.tolist()} mm，使用下蹲前 AABB ROI")
-            phase = "lower_arm_ready"
+            phase = Scene3Phase.LOWER_ARM_READY
             # 下蹲的阻塞等待结束后先处理一次 GUI 事件，避免窗口无响应。
             cv2.waitKey(1)
             continue
 
-        if phase == "lower_arm_ready":
+        if phase == Scene3Phase.LOWER_ARM_READY:
             assert(approach_plan)
 
             # 下层抓取必须使用计划中 layer=0 分配的手，不能复用上层手。
@@ -1481,7 +1505,7 @@ def run_scene3(robot, arm, claw, head, log):
 
             if lower_hand is None:
                 log("[ERROR] lower_hand_ready: no lower layer tray in plan")
-                phase = "walk_to_shelf"
+                phase = Scene3Phase.WALK_TO_SHELF
                 continue
 
             active_grab_hand = lower_hand
@@ -1537,14 +1561,14 @@ def run_scene3(robot, arm, claw, head, log):
             # grab_smt 的首帧再固定末端位姿，确保快照对应真正开始腕相机
             # 闭环校正时的姿态，而非 lower_hand_ready 的过渡姿态。
             grab_ref_quat = None
-            phase = "grab_smt"
+            phase = Scene3Phase.GRAB_SMT
             continue
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
 
-        if phase == "grab_smt":
+        if phase == Scene3Phase.GRAB_SMT:
             # 仅在进入抓取闭环的首帧快照末端位姿。之后横向/前向校正始终
             # 锁定同一四元数与绝对 Z，不能用每轮 FK 的下垂状态刷新基准。
             if grab_ref_quat is None:
@@ -1568,7 +1592,7 @@ def run_scene3(robot, arm, claw, head, log):
                 # 货架视觉规划到抓取位，直接闭爪尝试抓取并推进任务。
                 log(f"[WARN] {active_grab_hand} wrist: AABB ROI 内未检测到料盘，"
                     "跳过腕部校正，直接闭爪")
-                phase = "close_and_lift"
+                phase = Scene3Phase.CLOSE_AND_LIFT
             else:
                 offset = detection["offset_camera_mm"]
                 pixelOffset = detection["pixel_offset"]
@@ -1646,7 +1670,7 @@ def run_scene3(robot, arm, claw, head, log):
                                     f"剩余 Z={forwardErrorMm:.1f}mm；仍继续夹取")
                             else:
                                 log(f"[INFO] {active_grab_hand} wrist: 前向校正完成，开始夹取")
-                            phase = "close_and_lift"
+                            phase = Scene3Phase.CLOSE_AND_LIFT
                             continue
                         correction_camera = [0.0, 0.0, forwardErrorMm]
                         forward_pass += 1
@@ -1681,7 +1705,7 @@ def run_scene3(robot, arm, claw, head, log):
                         log(f"[WARN] {active_grab_hand} wrist: {stage_name}校正执行失败；"
                             "已清空移动前观测，等待新检测")
 
-        if phase == "close_and_lift":
+        if phase == Scene3Phase.CLOSE_AND_LIFT:
             (claw.left_close() if active_grab_hand == "left" else claw.right_close())
             claw.wait_until_done(timeout=3.0)
             rospy.sleep(3.0)
@@ -1716,11 +1740,11 @@ def run_scene3(robot, arm, claw, head, log):
             log(f"[INFO] {active_grab_hand} arm: 已上提")
 
             if current_grab_layer == 1:
-                phase = "back_for_lower"
+                phase = Scene3Phase.BACK_FOR_LOWER
             else:
-                phase = "back_home"
+                phase = Scene3Phase.BACK_HOME
 
-        if phase == "back_for_lower":
+        if phase == Scene3Phase.BACK_FOR_LOWER:
             # 后退不用太高精度，现在还是致盲状态。
             robot.move_backward(0.3, 1 / 0.3)  # 后退 1 m
 
@@ -1755,9 +1779,9 @@ def run_scene3(robot, arm, claw, head, log):
             approach_basis = None
             approach_plan_locked = False
             wrist_filter = WristDetectionFilter(window=5)
-            phase = "side_shift"
+            phase = Scene3Phase.SIDE_SHIFT
         
-        if phase == "back_home":
+        if phase == Scene3Phase.BACK_HOME:
             robot.stop()
             robot.move_backward(0.3, 2 / 0.3)  # 后退 1 m
 
@@ -1785,9 +1809,9 @@ def run_scene3(robot, arm, claw, head, log):
             # 每次进入转身阶段均重新取样，不能复用上一次世界系的墙面方向。
             turn.clear()
             log(f"[INFO] back_home: {active_grab_hand} arm 已放下，开始转向桌子")
-            phase = "turn_back_table"
+            phase = Scene3Phase.TURN_BACK_TABLE
 
-        if phase == "turn_back_table":
+        if phase == Scene3Phase.TURN_BACK_TABLE:
             # groundTangent 是视觉世界系的 X 轴：它由墙面法线及地面法线
             # 构造，并通过与上一帧候选轴的最大点积保持方向连续。机器人转
             # 过 180° 后，同一面墙在相机坐标中的方向相反，因此点积约为 -1。
@@ -1843,7 +1867,7 @@ def run_scene3(robot, arm, claw, head, log):
                     if cos_angle < -0.99:
                         log(f"[INFO] turn_back_table 完成: 停稳后 dot={cos_angle:.3f}, "
                             f"耗时={elapsed:.1f}s")
-                        phase = "walk_to_table"
+                        phase = Scene3Phase.WALK_TO_TABLE
                     else:
                         signed_sin = float(numpy.dot(
                             groundNormal,
@@ -1859,7 +1883,7 @@ def run_scene3(robot, arm, claw, head, log):
                         else:
                             robot.turn_right(0.2)
 
-        if phase == "walk_to_table":
+        if phase == Scene3Phase.WALK_TO_TABLE:
             if boxClass != 2:
                 # 转身后若离桌子/接收盒过近，AABB 不完整会导致 table 分类失败。
                 # 持续小步后退扩大头相机视野，直到能够稳定识别到桌子。
@@ -1876,9 +1900,9 @@ def run_scene3(robot, arm, claw, head, log):
                     robot.stop()
                     log(f"[INFO] walk_to_table 完成: "
                         f"near={near_face_dist:.0f}mm")
-                    phase = "table_side_shift"
+                    phase = Scene3Phase.TABLE_SIDE_SHIFT
 
-        if phase == "table_side_shift":
+        if phase == Scene3Phase.TABLE_SIDE_SHIFT:
             if boxClass != 2:
                 # 横向对齐前桌子未完整入镜时，后退扩大深度视野；原地停车
                 # 会一直保持同一张无法分类的画面。
@@ -1914,7 +1938,7 @@ def run_scene3(robot, arm, claw, head, log):
                 else:
                     robot.stop()
                     log("[INFO] table_side_shift 完成: 机器人中心已对齐桌上物体中心")
-                    phase = "table_pre_approach_arm_ready"
+                    phase = Scene3Phase.TABLE_PRE_APPROACH_ARM_READY
                     rate.sleep()
                     continue
 
@@ -1927,13 +1951,13 @@ def run_scene3(robot, arm, claw, head, log):
                 log(f"[INFO] table_side_shift: move_{direction}({speed:.2f}), "
                     f"目标横向误差={base_lateral_mm:.0f}mm")
 
-        if phase == "table_pre_approach_arm_ready":
+        if phase == Scene3Phase.TABLE_PRE_APPROACH_ARM_READY:
             # 在桌前精接近前先抬肩、折肘；这样接近结束后只需完成后续
             # table_arm_ready 姿态即可进入投放，避免在盒边一次性大幅摆臂。
             arm.switch_to_external_control()
             arm.go_to_joints([
-                40, 0, 0, 0, 0, 0, 0,
-                40, 0, 0, 0, 0, 0, 0,
+                40, 0, 0, 0, -90, 0, 0,
+                40, 0, 0, 0, 90, 0, 0,
             ])
             rospy.sleep(2.0)
             arm.go_to_joints([
@@ -1942,9 +1966,9 @@ def run_scene3(robot, arm, claw, head, log):
             ])
             rospy.sleep(6.0)
             log("[INFO] table_pre_approach_arm_ready: 双臂已完成肩部/前臂预备")
-            phase = "table_post_side_shift"
+            phase = Scene3Phase.TABLE_POST_SIDE_SHIFT
 
-        if phase == "table_post_side_shift":
+        if phase == Scene3Phase.TABLE_POST_SIDE_SHIFT:
             # 仿照货架前 post_side_shift：横向对齐后再以低速精确靠近。
             if boxClass != 2:
                 # 双臂预备后若桌子框不完整，后退扩大头相机视野，不能原地等待。
@@ -1964,9 +1988,9 @@ def run_scene3(robot, arm, claw, head, log):
                 else:
                     robot.stop()
                     waist_align.clear()
-                    phase = "table_waist_align"
+                    phase = Scene3Phase.TABLE_WAIST_ALIGN
 
-        if phase == "table_waist_align":
+        if phase == Scene3Phase.TABLE_WAIST_ALIGN:
             # 身体停稳后，以初始货架墙面方向为参考转腰补偿残余 yaw。
             # 目标不是 base 的 180°，而是头部/双臂所在上半身的视觉方向
             # 满足 dot(initial_tangent, groundTangent) < -0.99。
@@ -1983,7 +2007,7 @@ def run_scene3(robot, arm, claw, head, log):
                     waist_align["feedback_pending"] = False
                 if cos_angle < -0.99:
                     log(f"[INFO] table_waist_align 完成: dot={cos_angle:.3f}")
-                    phase = "table_arm_ready"
+                    phase = Scene3Phase.TABLE_ARM_READY
                 elif (not waist_align or
                       now - waist_align["commanded_at"] >= 1.0):
                     # signed_angle 是墙面方向在相机水平面中的有符号角。相机
@@ -2005,7 +2029,7 @@ def run_scene3(robot, arm, claw, head, log):
                         f"sin={signed_sin:.3f}, residual={residual_yaw_deg:.1f}°, "
                         f"waist={target_yaw_deg:.1f}°")
 
-        if phase == "table_arm_ready":
+        if phase == Scene3Phase.TABLE_ARM_READY:
             # [2] 是桌上接收盒的内缩 AABB。缓存当前 world/basis，后续双臂
             # 会遮挡头相机，不能再用新帧结果覆盖投放目标。
             if boxClass != 2 or len(objectBoundingBoxCorners) < 3:
@@ -2056,9 +2080,9 @@ def run_scene3(robot, arm, claw, head, log):
                 place_hand = None
                 place_quat = None
                 log("[INFO] table_arm_ready: 双臂投放预备完成，开始依次投放")
-                phase = "place_next_hand"
+                phase = Scene3Phase.PLACE_NEXT_HAND
 
-        if phase == "place_next_hand":
+        if phase == Scene3Phase.PLACE_NEXT_HAND:
             if place_index >= len(place_queue):
                 waist.reset_and_release()
                 robot.stop()
@@ -2090,11 +2114,11 @@ def run_scene3(robot, arm, claw, head, log):
             if endpoint_pose is None:
                 log(f"[WARN] {place_hand} 投放：无法读取预备姿态")
                 if retry_place_ik(place_hand, "hover pose"):
-                    phase = "place_next_hand"
+                    phase = Scene3Phase.PLACE_NEXT_HAND
                 else:
                     place_index += 1
                     place_hand = None
-                    phase = "place_next_hand"
+                    phase = Scene3Phase.PLACE_NEXT_HAND
             else:
                 _, place_quat = endpoint_pose
                 # 使用不带 FK 残差拒绝门限的单臂 IK；另一只手仍由当前关节角锁定。
@@ -2111,17 +2135,17 @@ def run_scene3(robot, arm, claw, head, log):
                 applied = ok and arm.apply_ik_single_arm_solution(place_hand, joints)
                 if not applied:
                     if retry_place_ik(place_hand, "hover"):
-                        phase = "place_next_hand"
+                        phase = Scene3Phase.PLACE_NEXT_HAND
                     else:
                         place_index += 1
                         place_hand = None
-                        phase = "place_next_hand"
+                        phase = Scene3Phase.PLACE_NEXT_HAND
                 else:
                     rospy.sleep(3.0)
                     log(f"[INFO] {place_hand} 投放：已到达盒子上方 hover 点")
-                    phase = "place_release_hand"
+                    phase = Scene3Phase.PLACE_RELEASE_HAND
 
-        if phase == "place_release_hand":
+        if phase == Scene3Phase.PLACE_RELEASE_HAND:
             ok, joints = arm.solve_ik_one_hand(
                 place_hand, place_release_base_m.tolist(), place_quat,
                 frame=2, constraint_mode=0x03)
@@ -2129,20 +2153,20 @@ def run_scene3(robot, arm, claw, head, log):
             if not applied:
                 # 未到达释放点绝不松爪；转腰后重新从 hover 开始求解。
                 if retry_place_ik(place_hand, "release"):
-                    phase = "place_next_hand"
+                    phase = Scene3Phase.PLACE_NEXT_HAND
                 else:
                     place_index += 1
                     place_hand = None
-                    phase = "place_next_hand"
+                    phase = Scene3Phase.PLACE_NEXT_HAND
             else:
                 rospy.sleep(2.0)
                 (claw.left_open() if place_hand == "left" else claw.right_open())
                 if not claw.wait_until_done(timeout=3.0):
                     log(f"[WARN] {place_hand} 投放：夹爪张开等待超时，继续后续流程")
                 log(f"[INFO] {place_hand} 投放：已下发松爪指令")
-                phase = "place_retract_hand"
+                phase = Scene3Phase.PLACE_RETRACT_HAND
 
-        if phase == "place_retract_hand":
+        if phase == Scene3Phase.PLACE_RETRACT_HAND:
             # 释放后尽力抬回 hover；失败也继续处理另一只手。
             ok, joints = arm.solve_ik_one_hand(
                 place_hand, place_hover_base_m.tolist(), place_quat,
@@ -2163,7 +2187,7 @@ def run_scene3(robot, arm, claw, head, log):
             place_index += 1
             place_hand = None
             place_quat = None
-            phase = "place_next_hand"
+            phase = Scene3Phase.PLACE_NEXT_HAND
 
         rate.sleep()
     # cv2.destroyWindow("depth")
