@@ -56,7 +56,14 @@ def _configure_camera_rendering(render_cameras):
 
 
 def _add_task_module_paths():
-    pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # rosrun 执行的通常是 devel/lib 下的入口副本；不能据此推断源码根目录。
+    # 优先由 rospkg 定位功能包，直接运行源码脚本时再使用相对路径回退。
+    try:
+        import rospkg
+        pkg_dir = rospkg.RosPack().get_path("challenge_cup_task_template")
+    except Exception:
+        pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
     src_dir = os.path.join(pkg_dir, "src")
     scripts_dir = os.path.join(pkg_dir, "scripts")
     for path in (src_dir, scripts_dir):
@@ -64,25 +71,54 @@ def _add_task_module_paths():
             sys.path.insert(0, path)
 
 
-def _run_teammate_scene(scene):
+def _run_teammate_scene(scene, scene2_perception_only=False,
+                        scene2_baseline_only=False,
+                        scene2_perception_camera="head",
+                        scene2_perception_output_dir="scene2_perception",
+                        scene2_perception_target_frame="base_link",
+                        display=False):
     _add_task_module_paths()
 
     import rospy
 
+    # 场景二的视觉分拣使用其独立的控制管线；它不接收本入口创建的
+    # RobotMover/ArmController 对象。
+    if scene == "scene2":
+        from scene2_task import (
+            _run_scene2_baseline,
+            _run_scene2_perception_debug,
+            _run_scene2_visual_sorting,
+        )
+
+        if scene2_perception_only:
+            _run_scene2_perception_debug(
+                scene2_perception_camera,
+                scene2_perception_output_dir,
+                scene2_perception_target_frame,
+                display=display,
+            )
+            rospy.loginfo("=== 场景二感知调试结束 ===")
+        elif scene2_baseline_only:
+            _run_scene2_baseline()
+        else:
+            _run_scene2_visual_sorting(
+                camera=scene2_perception_camera,
+                output_dir=scene2_perception_output_dir,
+                target_frame=scene2_perception_target_frame,
+                display=display,
+            )
+        return
+
     # 场景三依赖本分支扩展过的 robot_api3（腰部控制、单臂 IK 等）；
-    # 场景一、二保持使用与 main 一致的 robot_api。
+    # 场景一保持使用与 main 一致的 robot_api。
     if scene == "scene3":
         from robot_api3 import RobotMover, ArmController, ClawController, HeadController
         from scene3_task import run_scene3
         scene_handler = run_scene3
     else:
         from robot_api import RobotMover, ArmController, ClawController, HeadController
-        if scene == "scene1":
-            from scene1_task import run_scene1
-            scene_handler = run_scene1
-        else:
-            from scene2_task import run_scene2
-            scene_handler = run_scene2
+        from scene1_task import run_scene1
+        scene_handler = run_scene1
 
     robot = RobotMover()
     arm = ArmController()
@@ -96,7 +132,11 @@ def _run_teammate_scene(scene):
 
 
 def run_scene(scene, seed, node_name=None, timeout=120,
-              time_limit=None, timer_gui=True, render_cameras=None):
+              time_limit=None, timer_gui=True, render_cameras=None,
+              scene2_perception_only=False, scene2_baseline_only=False,
+              scene2_perception_camera="head",
+              scene2_perception_output_dir="scene2_perception",
+              scene2_perception_target_frame="base_link", display=False):
     if scene not in SCENE_CONFIGS:
         raise ValueError("unknown scene: {}".format(scene))
 
@@ -120,9 +160,19 @@ def run_scene(scene, seed, node_name=None, timeout=120,
     rospy.sleep(1.0)
     rospy.loginfo("场景实例已初始化。")
 
-    _run_teammate_scene(scene)
+    _run_teammate_scene(
+        scene,
+        scene2_perception_only=scene2_perception_only,
+        scene2_baseline_only=scene2_baseline_only,
+        scene2_perception_camera=scene2_perception_camera,
+        scene2_perception_output_dir=scene2_perception_output_dir,
+        scene2_perception_target_frame=scene2_perception_target_frame,
+        display=display,
+    )
 
-    rospy.spin()
+    # 场景二的独立任务管线完成后应直接退出；场景一、三保留原有节点。
+    if scene != "scene2":
+        rospy.spin()
 
 
 def main():
@@ -141,6 +191,18 @@ def main():
                         help="不弹出计时器窗口，仅保留后台计时日志")
     parser.add_argument("--render-cameras", action="store_true",
                         help="保留 MuJoCo 三路相机渲染与压缩发布；默认关闭以降低 CPU 压力")
+    parser.add_argument("--scene2-perception-only", action="store_true",
+                        help="仅用于开发调试：启动场景二并执行一次 RGB-D 识别，不执行抓取")
+    parser.add_argument("--scene2-baseline-only", action="store_true",
+                        help="仅用于回归对比：场景二不使用视觉识别，直接运行固定目标 baseline")
+    parser.add_argument("--scene2-perception-camera", choices=["head", "left", "right"],
+                        default="head", help="场景二感知使用的相机")
+    parser.add_argument("--scene2-perception-output-dir", default="scene2_perception",
+                        help="场景二感知图像和 JSON 输出目录（默认相对当前工作目录）")
+    parser.add_argument("--scene2-perception-target-frame", default="base_link",
+                        help="场景二感知的 TF 目标坐标系")
+    parser.add_argument("--display", action="store_true",
+                        help="弹出 imshow 窗口实时显示场景二检测结果（需要 X11 环境）")
     args = parser.parse_args()
 
     run_scene(
@@ -151,6 +213,12 @@ def main():
         time_limit=args.time_limit,
         timer_gui=not args.no_timer_gui,
         render_cameras=args.render_cameras,
+        scene2_perception_only=args.scene2_perception_only,
+        scene2_baseline_only=args.scene2_baseline_only,
+        scene2_perception_camera=args.scene2_perception_camera,
+        scene2_perception_output_dir=args.scene2_perception_output_dir,
+        scene2_perception_target_frame=args.scene2_perception_target_frame,
+        display=args.display,
     )
 
 
