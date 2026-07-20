@@ -71,7 +71,7 @@ def _add_task_module_paths():
             sys.path.insert(0, path)
 
 
-def _run_teammate_scene(scene, scene2_perception_only=False,
+def _run_teammate_scene(scene, seed=0, scene2_perception_only=False,
                         scene2_baseline_only=False,
                         scene2_perception_camera="head",
                         scene2_perception_output_dir="scene2_perception",
@@ -109,16 +109,26 @@ def _run_teammate_scene(scene, scene2_perception_only=False,
             )
         return
 
-    # 场景三依赖本分支扩展过的 robot_api3（腰部控制、单臂 IK 等）；
-    # 场景一保持使用与 main 一致的 robot_api。
-    if scene == "scene3":
-        from robot_api3 import RobotMover, ArmController, ClawController, HeadController
-        from scene3_task import run_scene3
-        scene_handler = run_scene3
-    else:
-        from robot_api import RobotMover, ArmController, ClawController, HeadController
+    # 场景一保留组员扩展过的控制 API，避免覆盖场景二的 robot_api
+    # 和场景三的 robot_api3。其任务动作自行创建官方 hold 控制器，故不在
+    # 统一入口预先等待非必需的夹爪服务。
+    if scene == "scene1":
+        from robot_api1 import RobotMover, ArmController, HeadController
         from scene1_task import run_scene1
-        scene_handler = run_scene1
+
+        robot = RobotMover()
+        arm = ArmController()
+        head = HeadController()
+
+        def log(message, *args):
+            rospy.loginfo(message, *args)
+
+        run_scene1(robot, arm, None, head, log, seed=seed)
+        return
+
+    # 场景三依赖本分支扩展过的 robot_api3（腰部控制、单臂 IK 等）。
+    from robot_api3 import RobotMover, ArmController, ClawController, HeadController
+    from scene3_task import run_scene3
 
     robot = RobotMover()
     arm = ArmController()
@@ -128,7 +138,7 @@ def _run_teammate_scene(scene, scene2_perception_only=False,
     def log(message, *args):
         rospy.loginfo(message, *args)
 
-    scene_handler(robot, arm, claw, head, log)
+    run_scene3(robot, arm, claw, head, log)
 
 
 def run_scene(scene, seed, node_name=None, timeout=120,
@@ -162,6 +172,7 @@ def run_scene(scene, seed, node_name=None, timeout=120,
 
     _run_teammate_scene(
         scene,
+        seed=seed,
         scene2_perception_only=scene2_perception_only,
         scene2_baseline_only=scene2_baseline_only,
         scene2_perception_camera=scene2_perception_camera,

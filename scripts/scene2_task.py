@@ -456,42 +456,48 @@ def _scene2_apply_detection_to_job(sc2, job, det, grasp_offset=None, arm=None):
     return updated
 
 
-def _scene2_add_detection_pose_quats(job, det):
+def _scene2_add_detection_pose_quats(job, det, swap_screwdriver_grasp_axis=False):
     """为任务添加基于检测角度计算的抓取/抬升/放置姿态四元数。
-    
-    仅对 type_a 和 type_c 零件计算姿态。
-    
-    参数:
-        job: 任务字典
-        det: 检测结果字典
-    
-    返回:
-        dict: 更新后的任务字典（含 grasp_quat, lift_quat, place_quat）
+
+    螺丝刀（type_c）的图像轮廓可能把长、短边主轴认反。首次抓取沿
+    检测轴执行；抓取验证失败后的重试传入 ``swap_screwdriver_grasp_axis``，
+    会将抓取和抬升姿态绕桌面法线旋转 90°，改用正交夹取方向。
+    放置姿态保持原有标定，不随重试改变。
     """
-    if not job["object"].startswith(("part_type_a", "part_type_c")):
+    object_name = job["object"]
+    if not object_name.startswith(("part_type_a", "part_type_c")):
         return job
+
     # A 零件的宽扁轮廓在图像角度仅变化几度时就可能跨越窄边决策边界。
     # 其夹取不需要物体偏航跟踪，因此抓取/抬升姿态保持校准的零角度。
-    grasp_lift_angle_deg = 0.0 if job["object"].startswith("part_type_a") else det.get("angle_deg")
+    is_screwdriver = object_name.startswith("part_type_c")
+    grasp_lift_angle_deg = 0.0 if object_name.startswith("part_type_a") else det.get("angle_deg")
+    swapped = bool(is_screwdriver and swap_screwdriver_grasp_axis)
+    if swapped and grasp_lift_angle_deg is not None:
+        # minAreaRect 的 long/short 轴正交；旋转 90° 即切换夹取方向。
+        grasp_lift_angle_deg = float(grasp_lift_angle_deg) + 90.0
+
     grasp_quat = _scene2_detection_pose_quat(
-        job["object"],
+        object_name,
         job["arm"],
         grasp_lift_angle_deg,
         "grasp_pose",
     )
     lift_quat = _scene2_detection_pose_quat(
-        job["object"],
+        object_name,
         job["arm"],
         grasp_lift_angle_deg,
         "lift_pose",
     )
     place_quat = _scene2_detection_pose_quat(
-        job["object"],
+        object_name,
         job["arm"],
         det.get("angle_deg"),
         "place_pose",
     )
     updated = dict(job)
+    if is_screwdriver:
+        updated["screwdriver_grasp_axis"] = "orthogonal" if swapped else "detected"
     if grasp_quat is not None:
         updated["grasp_quat"] = grasp_quat
     if lift_quat is not None:
@@ -742,7 +748,12 @@ def _scene2_refine_job_with_wrist(
         return job
 
     refined = _scene2_apply_detection_to_job(sc2, job, det, arm=active_arm)
-    refined = _scene2_add_detection_pose_quats(refined, det)
+    refined = _scene2_add_detection_pose_quats(
+        refined,
+        det,
+        swap_screwdriver_grasp_axis=(
+            job.get("screwdriver_grasp_axis") == "orthogonal"),
+    )
     rospy.loginfo(
         "scene2 wrist refine: %s %s camera=%s old_grasp=%s refined_camera=%s refined_grasp=%s",
         job["object"],
@@ -1032,15 +1043,25 @@ def _scene2_relocalize_retry_job(sc2, job, camera, output_dir, target_frame,
         grasp_offset=offset,
         arm=None,
     )
-    retry_job = _scene2_add_detection_pose_quats(retry_job, det)
+    # 螺丝刀的首抓使用检测到的主轴；一旦验证失败，后续重试固定切换到
+    # 正交轴，覆盖检测器把长、短边方向判反的情形。
+    swap_screwdriver_grasp_axis = (
+        job["object"].startswith("part_type_c") and int(attempt_index) >= 2)
+    retry_job = _scene2_add_detection_pose_quats(
+        retry_job,
+        det,
+        swap_screwdriver_grasp_axis=swap_screwdriver_grasp_axis,
+    )
     rospy.logwarn(
-        "scene2 retry: %s re-localized attempt=%d camera=%s offset=%s arm=%s grasp=%s",
+        "scene2 retry: %s re-localized attempt=%d camera=%s offset=%s arm=%s "
+        "grasp=%s screwdriver_axis=%s",
         job["object"],
         attempt_index,
         det.get("base_link_xyz_m"),
         [round(float(v), 4) for v in offset],
         retry_job["arm"],
         [round(v, 4) for v in retry_job["grasp"]],
+        retry_job.get("screwdriver_grasp_axis", "n/a"),
     )
     return retry_job
 
@@ -1073,12 +1094,18 @@ def _scene2_refresh_retry_job(sc2, job, camera, output_dir, target_frame, retry_
     if det is None:
         rospy.logwarn("scene2 retry: %s not visible, cannot refresh grasp", job["object"])
         return None
-    return _scene2_apply_detection_to_job(
+    refreshed = _scene2_apply_detection_to_job(
         sc2,
         job,
         det,
         grasp_offset=retry_spec["offset"],
         arm=retry_spec["arm"],
+    )
+    return _scene2_add_detection_pose_quats(
+        refreshed,
+        det,
+        swap_screwdriver_grasp_axis=(
+            job.get("screwdriver_grasp_axis") == "orthogonal"),
     )
 
 
