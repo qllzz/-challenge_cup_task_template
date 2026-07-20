@@ -1956,8 +1956,8 @@ def run_scene3(robot, arm, claw, head, log):
             # table_arm_ready 姿态即可进入投放，避免在盒边一次性大幅摆臂。
             arm.switch_to_external_control()
             arm.go_to_joints([
-                40, 0, 0, 0, -90, 0, 0,
-                40, 0, 0, 0, 90, 0, 0,
+                40, 0, 0, -140, -90, 0, 0,
+                40, 0, 0, -140, 90, 0, 0,
             ])
             rospy.sleep(2.0)
             arm.go_to_joints([
@@ -1975,7 +1975,7 @@ def run_scene3(robot, arm, claw, head, log):
                 robot.move_backward(0.05)
                 log("[INFO] table_post_side_shift: waiting for table detection; backing up")
             else:
-                target_dist = 200.0  # mm，桌子近端面到头相机的目标距离
+                target_dist = 220.0  # mm，桌子近端面到头相机的目标距离
                 tolerance = 15.0
                 near_face_dist = min(abs(boxFPos), abs(boxBPos))
                 error = near_face_dist - target_dist
