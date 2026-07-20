@@ -11,7 +11,7 @@ except ImportError:
     cv2 = None
 
 from perception_api import CameraReader, SensorReader, TFReader
-from robot_api import WaistController
+from robot_api3 import WaistController
 from sensor_msgs.msg import CameraInfo
 
 HEAD_CAMERA_FRAME = "Head Camera View"

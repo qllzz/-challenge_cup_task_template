@@ -68,10 +68,21 @@ def _run_teammate_scene(scene):
     _add_task_module_paths()
 
     import rospy
-    from robot_api import RobotMover, ArmController, ClawController, HeadController
-    from scene1_task import run_scene1
-    from scene2_task import run_scene2
-    from scene3_task import run_scene3
+
+    # 场景三依赖本分支扩展过的 robot_api3（腰部控制、单臂 IK 等）；
+    # 场景一、二保持使用与 main 一致的 robot_api。
+    if scene == "scene3":
+        from robot_api3 import RobotMover, ArmController, ClawController, HeadController
+        from scene3_task import run_scene3
+        scene_handler = run_scene3
+    else:
+        from robot_api import RobotMover, ArmController, ClawController, HeadController
+        if scene == "scene1":
+            from scene1_task import run_scene1
+            scene_handler = run_scene1
+        else:
+            from scene2_task import run_scene2
+            scene_handler = run_scene2
 
     robot = RobotMover()
     arm = ArmController()
@@ -81,12 +92,7 @@ def _run_teammate_scene(scene):
     def log(message, *args):
         rospy.loginfo(message, *args)
 
-    scene_handlers = {
-        "scene1": run_scene1,
-        "scene2": run_scene2,
-        "scene3": run_scene3,
-    }
-    scene_handlers[scene](robot, arm, claw, head, log)
+    scene_handler(robot, arm, claw, head, log)
 
 
 def run_scene(scene, seed, node_name=None, timeout=120,
